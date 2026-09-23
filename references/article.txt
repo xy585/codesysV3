@@ -1,0 +1,179 @@
+﻿Codesys V3协议漏洞挖掘方法 - FreeBuf网络安全行业门户
+icon_collect_sel
+限时体验
+热
+新
+切片
+切片
+形状
+切片
+切片
+主站  分类
+云安全
+AI安全
+开发安全
+终端安全
+数据安全
+Web安全
+基础安全
+企业安全
+关基安全
+移动安全
+系统安全
+其他安全
+特色
+热点
+工具
+漏洞
+人物志
+活动
+安全招聘
+攻防演练
+政策法规
+报告
+专辑
+培训站商城
+用户服务
+行业服务
+政 府
+CNCERT
+CNNVD
+会员体系（甲方）
+会员体系（厂商）
+产品名录
+企业空间
+知识大陆
+搜索
+创作中心
+登录注册
+Codesys V3协议漏洞挖掘方法
+' style="background-blend-mode:normal!important;background-clip:content-box!important;background-position:50% 50%!important;background-color:rgba(0,0,0,0)!important;background-image:var(--sf-img-10)!important;background-size:100% 100%!important;background-origin:content-box!important;background-repeat:no-repeat!important;background-attachment:scroll!important"> ic3blac4
+关注
+关基安全
+012345678901234567890123456789
+012345678901234567890123456789
+012345678901234567890123456789
+Codesys V3协议漏洞挖掘方法
+ic3blac4
+2023-08-07 21:12:54
+668662
+' alt class=img style="background-blend-mode:normal!important;background-clip:content-box!important;background-position:50% 50%!important;background-color:rgba(0,0,0,0)!important;background-image:var(--sf-img-11)!important;background-size:100% 100%!important;background-origin:content-box!important;background-repeat:no-repeat!important;background-attachment:scroll!important">
+本文由
+ic3blac4 创作，已纳入「FreeBuf原创奖励计划」，未授权禁止转载
+背景概述
+Codesys是全球最著名的软PLC内核软件研发厂家德国的3S（SMART，SOFTWARE，SOLUTIONS）公司发布的一款与制造商无关IEC 61131-1编程软件及工控设备内核（runtime SDK）。Codesys 支持完整版本的IEC61131标准的编程环境，支持标准的六种编程语言，是一个标准的与硬件无关的Runtime，被很多硬件厂家支持， Codesys提供了许多组合产品的扩充，诸如各种不同领域的总线配置程序和运动控制系统。由于Codesys提供的解决方案覆盖全面、功能强大、开发周期短、灵活性高、支持硬件架构及操作系统丰富等原因在全球工控厂商中广泛使用，据官方统计使用Codesys解决方案的知名企业超过500家，Codesys市场占有率为35%，其中我们熟知ABB、施耐德电气、费斯托Festo、伊顿电气、博世力士乐、WAGO、倍福BECKHOFF、研华科技、凌华科技、巴赫曼Bachmann、KEBA、深圳合信、汇川技术、深圳英威腾、华中数控、步科、固高科技等等都使用了Codesys Runtime。更详细的合作厂商及案例见Codesys厂商网站：http://www.codesys.cn/list-Partner-1.html正因为诸多知名工控厂商大规模使用该内核，因此Codesys产品的安全性影响巨大。一旦源头出现问题则很有可能影响诸多厂商的多款产品使工业生产过程面临严重威胁。出于此目的，笔者从2021年开始研究Codesys V2相关产品并发现了数十个漏洞，提交给厂商后经过修改发布了最新修复版本，详情请见链接[1]所示。Codesys V2产品设计理念只关注了功能业务在信息安全方面涉及较少。目前主推的Codesys V3产品宣称加入了信息安全的设计考量，那么是不是就无懈可击呢？本文就带领大家看看笔者是如何从Codesys厂商的安全通告出发一步步发现多个漏洞的。信息收集
+先打开Codesys厂商的安全通告网站，浏览相关安全通告。2023-2的这份通告[2]吸引了笔者的注意力，其中包含了大量的漏洞而且都是通信协议相关，最重要的是暴露了很多敏感信息让我们可以从中分析出很有价值的信息。下图为CVE编号总数为16个，且影响的是V3.5.19.0以前的所有版本的多个通信组件。从通告中选取存在CVE编号最多的一个组件开始详细分析，这些漏洞的类型为栈溢出，影响组件名称为CmpTraceMgr。可以得出结论：在Codesys V3.5.19.0之前版本中CmpTraceMgr组件存在多个地方的栈溢出漏洞。接下来我们的思路如下：搭建Codesys V3.5.19.0之前任一版本和该版本环境，从Codesys V3自带模拟器control win V3出发分析在CmpTraceMgr组件中修改了哪些存在栈溢出风险的代码在存在漏洞的Codesys模拟器环境下构造报文进行漏洞复现和分析；学习2023-2安全通告中微软研究人员的相关思路，在修复后的版本模拟器中挖掘漏洞；环境搭建
+在Codesys厂商官网下载受影响的版本Codesys V3.5.18.20将其安装在Windows 10虚拟机中，安装后启动模拟器，并且在x64dbg工具中将其进程附加，如下所示由于模拟器使用了威步wibu的安全解决方案因此需要利用插件从内存中对其dump后进行整体分析同样，我们还需要下载修改漏洞后的版本Codesys V3.5.19.0软件并在另外一个虚拟机上安装，安装后同样进行dump内存操作。将2个dump后的内存文件分别保存，以备后续步骤使用。准备两个不同版本的模拟器后，还需要搭建一个IDE开发环境，给两个模拟器中分别下装简单的测试工程，如下所示。漏洞点定位
+将前述的两个dump文件导入至IDA进行分析，首先对Codesys V3.5.18.20的CODESYSControlService_dump.exe进行分析。通过字符串定位CmpTraceMgr组件位置，直接利用CmpTraceMgr字符串定位发现存在诸多困难，比如字符搜索“CmpTraceMgr”出现的引用较少，函数之间也没有引用关系，或者利用引用字符串搜索出现的调用有太多，如下所示基于此需要变换策略，有两个思路：A.搭建环境，在IDE编程软件中添加trace功能，执行多项操作，抓取报文从报文信息出发进行关键词搜索；B.利用Codesys V3带有符号的固件代码进行比对快速定位关键点；2. 基于1步骤提出的B思路，从某个使用了Codesys V3 Runtime的固件（带有符号表）中比对搜索CmpTraceMgr，再在关键位置找到特征字符串后，利用该字符串在5.18.20模拟器dump分析文件中进行搜索。如下图是在带有符号表的固件中搜索结果再在该函数中寻找特殊字符“Creating events failed”接下来利用特殊字符在目标文件中进行搜索，并且可以对照带有符号表的固件对目标文件进行函数重命名；3. 利用Creating events failed作为特征字符搜索定位在该函数中寻找CmpTraceMgr处理部分，最终定位到函数为TraceMgr的处理部分，如下所示4. 熟悉TraceMgr整个函数处理流程，再次打开5.19.0的CODESYSControlService_dump.exe分析文件，分析过程如前所述，找到TraceMgr处理函数后，逐个过程比对每个流程中的函数实现的差异点。按照如上思路，在TraceMgrSrvPacketCreate函数中找到了差异点，下图是V3.5.18.20的TraceMgrSrvPacketCreate处理部分，当输入参数为19、20、21等值时，进入mencpy分支但是对比V3.5.19.0的TraceMgrSrvPacketCreate处理部分时发现其对该部分做了特殊处理（对输入的内容做限制长度），并且使用的BTagReaderGetContent函数都是特殊封装后的，因此可以断定是由于使用了memcpy函数并且未对输入参数进行检查验证出现的栈溢出漏洞。漏洞复现及分析
+基于前述的分析，我们要复现漏洞首先需要了解Codesys V3通信协议相关的基础知识，该部分可以参考看雪论坛中的文章《Codesys V3 协议及授权机制分析》。要触发该漏洞，需要经过如下通信流程：打开通道，此时模拟器会给客户端返回channel_id,该值在后续的通信中会用到；创建会话连接，模拟器会给客户端返回session_id，同样该值在后续的请求报文中需要携带；获取challenge值，用来进行授权验证相关算法使用；发送授权后的登录请求，输入正确的用户名和密码才可进行敏感操作；发送应用程序的登录请求，此时模拟器会返回op_key，后续的敏感操作还需要携带该值；至此才可以发送服务码为TraceMgrServic群组中子功能码为TraceMgrSrvPacketCreate的PoC攻击报文；发送攻击报文后，在调试模式下分析漏洞根因。发送报文payload部分填充0x18ac个A，可以看到在memcpy之前目的地址片区布局正常。当执行完memcpy之后内存布局如下所示，栈上空间全被AAAA填充。基于此漏洞后续还可以做漏洞利用，在栈上构造指向“目标”函数的指针已达到远程代码执行的效果，本文中不再深入讲解。漏洞复现及分析
+在第五章讲述的基础上结合2023-02的安全通告，我们继续可以深入各个服务群组的各个子功能码进行协议模糊测试，服务群组信息如下所示比如我们可以深入AppServiceHandler中的各个子功能码函数进行测试，构造进入各个分支函数的报文进行模糊测试。由于Codesys V3协议对象层次清晰，报文结构有研究机构已经披露[3],因此可以采用基于生产的模糊测试进行漏洞挖掘工作，推荐采用boofuzz框架，可以参考claroty开源的OPC UA模糊测试程序[4]来适配Codesys V3协议的模糊测试。笔者采用多种模糊测试技术已经在修改后的版本V3.5.19.0模拟器上发现了多个漏洞并且将这些漏洞上报给国家相关单位。在2023年8月10日的Blackhat USA会议上，微软的研究人员将分享他们发现Codesys V3协议16个漏洞的相关议题，感兴趣的朋友可以围观。笔者在该议题开讲之前先在国内对Codesys V3协议漏洞的分析和发现方法做一分享，让大家提前预热。防护措施
+由于Codesys V3现在广泛应用在各大工控厂商的产品中，因此这些漏洞的影响范围较广，工控系统用户应做好积极防护措施。将受影响的产品放置于安全防护设备之后，做好网络安全的纵深防御策略；当需要进行远程访问时，尽量采用安全的VPN网络，并且做好访问审计；关注受影响厂商的安全补丁，经过测试后升级受影响的产品以使其免受威胁。尽量减少受影响设备的私有通信端口暴露，可根据业务场景选择关闭1740/1741/1742/1743/11740/11741等端口；尽量给受影响的控制器设置用户名和密码保护，设置保护策略后攻击难度提升必须要获取用户名和密码后才能执行攻击；建议使用Codesys V3 runtime的工控厂商及时自查，并且积极修复，发布修复版本的固件；总结
+本文以在国际上广泛使用的Codesys V3为研究对象，从Codesys厂商安全通告出发进行信息搜集和分析 ，进行了漏洞复现和分析，并且在修改过后的版本中发现了新的漏洞，以此来阐述对于工控安全研究的思路和方法，也让更多对于保护工业系统安全的有识之士能够看到并且共同守护工控系统的安全。相关链接
+[1]：https://github.com/ic3sw0rd/Codesys_V2_Vulnerability[2]: https://customers.codesys.com/index.php?eID=dumpFile&t=f&f=17554&token=5444f53b4c90fe37043671a100dffa75305d1825&download=[3]: https://ics-cert.kaspersky.com/publications/reports/2019/09/18/security-research-Codesys-runtime-a-plc-control-framework-part-2/[4]: https://github.com/claroty/opcua_network_fuzzer﻿
+# 漏洞 # 工控安全 # 漏洞分析 # CODESYS WebVisu # 供应链安全
+ic3blac4
+专注工控安全研究
+' alt style="background-blend-mode:normal!important;background-clip:content-box!important;background-position:50% 50%!important;background-color:rgba(0,0,0,0)!important;background-image:var(--sf-img-11)!important;background-size:100% 100%!important;background-origin:content-box!important;background-repeat:no-repeat!important;background-attachment:scroll!important">
+已在FreeBuf发表 8 篇文章
+本文为 ic3blac4 独立观点，未经授权禁止转载。
+如需授权、对文章有疑问或需删除稿件，请联系 FreeBuf
+客服小蜜蜂（微信：freebee1024）
+被以下专辑收录，发现更多精彩内容
++ 收入我的专辑
++ 加入我的收藏
+相关推荐
+漏洞复现--织梦CMS_V5.7任意用户密码重置漏洞
+漏洞
+声明：请勿将文章内的相关技术用于非法目的，如有相关非法行为与文章作者和本公众号无关。请遵守《中华人民共和国网络安全法》。一.漏洞简介织梦内容...
+' style="background-blend-mode:normal!important;background-clip:content-box!important;background-position:50% 50%!important;background-color:rgba(0,0,0,0)!important;background-image:var(--sf-img-10)!important;background-size:cover!important;background-origin:content-box!important;background-repeat:no-repeat!important;background-attachment:scroll!important"> 恒梦安全
+278207围观 2023-08-16
+基于LazyList的Scala反序列化漏洞透析(CVE-2022-36944)
+原创
+转为PDF
+基础安全
+Scala语言是一门多范式的编程语言，设计初衷是要集成面向对象编程和函数式编程的各种特性。
+' style="background-blend-mode:normal!important;background-clip:content-box!important;background-position:50% 50%!important;background-color:rgba(0,0,0,0)!important;background-image:var(--sf-img-10)!important;background-size:cover!important;background-origin:content-box!important;background-repeat:no-repeat!important;background-attachment:scroll!important"> 小白LanB0
+425789围观
+· 3收藏
+· 35喜欢
+2023-08-16
+fastjson反序列化漏洞总结
+原创
+Web安全
+FastJson是啊里巴巴的的开源库，用于对JSON格式的数据进行解析和打包。其实简单的来说就是处理json格式的数据的。例如将json转换...
+' style="background-blend-mode:normal!important;background-clip:content-box!important;background-position:50% 50%!important;background-color:rgba(0,0,0,0)!important;background-image:var(--sf-img-10)!important;background-size:cover!important;background-origin:content-box!important;background-repeat:no-repeat!important;background-attachment:scroll!important"> 小菜鸡xiaocaiji
+224465围观
+· 1收藏
+· 5喜欢
+2023-08-16
+Smartbi 修改用户密码漏洞
+原创
+漏洞
+通过查看 Smartbi 的补丁包信息，发现存在漏洞在某种特定情况下修改用户的密码，进行简单的复现和分析。
+蚁景科技
+191027围观
+· 2收藏
+2023-08-15
+Nexus系列漏洞复现
+原创
+漏洞
+其3.14.0及之前版本中，存在一处基于OrientDB自定义函数的任意JEXL表达式执行功能，而这处功能存在未授权访问漏洞，将可以导致任意...
+' style="background-blend-mode:normal!important;background-clip:content-box!important;background-position:50% 50%!important;background-color:rgba(0,0,0,0)!important;background-image:var(--sf-img-10)!important;background-size:cover!important;background-origin:content-box!important;background-repeat:no-repeat!important;background-attachment:scroll!important"> Fleabane
+562408围观
+· 1收藏
+2023-08-15
+' style="background-blend-mode:normal!important;background-clip:content-box!important;background-position:50% 50%!important;background-color:rgba(0,0,0,0)!important;background-image:var(--sf-img-10)!important;background-size:100% 100%!important;background-origin:content-box!important;background-repeat:no-repeat!important;background-attachment:scroll!important">
+ic3blac4 LV.3
+专注工控安全研究
+关 注
+8 文章数
+15 关注者
+PLC编程软件AI助手服务漏洞挖掘方法
+2026-08-21
+施耐德 M580 工业控制器固件安全分析与解密研究
+2026-07-10
+艾默生DeltaV DCS控制器固件安全分析技术
+2026-07-02
+浏览更多
+文章目录
+背景概述
+信息收集
+环境搭建
+漏洞点定位
+漏洞复现及分析
+漏洞复现及分析
+防护措施
+总结
+相关链接
+本站由阿里云 提供计算与安全服务
+用户服务
+有奖投稿
+提交漏洞
+参与众测
+商城
+企业服务
+安全咨询
+产业全景图
+企业SRC
+安全众测
+合作信息
+斗象官网
+广告投放
+联系我们
+关于我们
+关于我们
+微信公众号
+新浪微博
+战略伙伴
+FreeBuf知识大陆
+扫码把安全装进口袋
+斗象科技
+FreeBuf
+漏洞盒子
+斗象智能安全
+免责条款
+协议条款
+Copyright © 2026 WWW.FREEBUF.COM All Rights Reserved
+沪ICP备2024099014号
+|
+沪公安网备
