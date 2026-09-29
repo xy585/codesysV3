@@ -141,7 +141,12 @@ GRP_TRACE     = 0x000F      # CmpTraceMgr
 
 # CmpTraceMgr sub-commands (from trace.pcapng)
 TRACE_LIST    = 0x0001      # empty body -> list of trace names
-TRACE_CONFIGURE = 0x0002    # name + config + variable list -> handle
+TRACE_CONFIGURE = 0x0002    # name + config + variable list -> handle.
+                            # Name is behavioural, not symbolic.  This is the
+                            # only id that reaches TraceMgrServiceHandler - the
+                            # function carrying the 5 unchecked memcpys (see
+                            # trace_poc.py); the group's other 18 sub-functions
+                            # (ids 1..0x13, dispatched by sub_1077280) have none.
 TRACE_START   = 0x0004      # handle -> status  (starts recording; this is the
                             #   one the IDE issues in trace2.pcapng)
 TRACE_DELETE  = 0x0003      # handle -> status  (deletes the trace - calling it

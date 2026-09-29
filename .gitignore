@@ -1,0 +1,9 @@
+*.log
+*.db
+*.jsonl
+*.png
+*.html
+*.csv
+references/
+logs/
+pcapng/
