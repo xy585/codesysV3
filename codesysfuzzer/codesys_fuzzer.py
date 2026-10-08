@@ -34,7 +34,9 @@ from boofuzz import exception
 from boofuzz.mutation_context import MutationContext
 
 from fuzzer import Fuzzer
+from runstate import RunState
 from proto import TCP_PORT
+from utils import run_seed, set_run_seed
 from services import MODEL_DIMENSIONS, REQUESTS, request_names
 
 
@@ -228,6 +230,28 @@ def main():
                     help="re-run a single test case index (from a crash report)")
     ap.add_argument("--case-count", type=int, default=1,
                     help="with --case: how many cases to run from that index")
+    ap.add_argument("--log-payloads", action="store_true",
+                    help="also log the full hex of every transmitted request.  "
+                         "Off by default: over a long run that is a copy of the "
+                         "whole corpus.  The request that triggers a crash is "
+                         "written out in full regardless, by the crash report")
+    ap.add_argument("--seed", type=lambda s: int(s, 0), default=None,
+                    help="pin the run's random seed.  Payloads are drawn from a "
+                         "per-run seed rather than a fixed one, so two runs of a "
+                         "model send different bytes; pass the same seed to "
+                         "reproduce a run exactly.  The seed in use is recorded "
+                         "in the run state file")
+    ap.add_argument("--state", metavar="FILE", default=None,
+                    help="run state file (default <log-dir>/<request>.state.json)")
+    ap.add_argument("--state-every", type=int, default=25,
+                    help="write the run state every N cases")
+    ap.add_argument("--force-new", action="store_true",
+                    help="start a fresh run even though the state file already "
+                         "holds an unfinished one, discarding its resume point")
+    ap.add_argument("--resume", metavar="FILE", default=None,
+                    help="resume an interrupted run from its state file: "
+                         "continues at the first case that has not run, with the "
+                         "recorded seed, instead of repeating what already ran")
     ap.add_argument("--sleep", type=float, default=0.0,
                     help="seconds to pause between test cases")
     ap.add_argument("--reply-timeout", type=float, default=2.0,
@@ -283,12 +307,47 @@ graded black-box modes — how much you tell it about the target:
 
     if not args.target:
         ap.error("a target address is required (or use --list-requests)")
-    if not args.request and not args.all and not args.all_groups             and not args.from_pairs:
+    # --resume can supply the request, so it must not be required up front
+    if not args.request and not args.all and not args.all_groups             and not args.from_pairs and not args.resume:
         ap.error("--request is required (or --all / --all-groups / --from-pairs "
-                 "/ --list-requests)")
+                 "/ --resume / --list-requests)")
 
     if not os.path.isdir(args.log_dir):
         os.makedirs(args.log_dir, exist_ok=True)
+
+    # resume first: it can supply the request/group/service the command omitted
+    resume_state = None
+    if args.resume:
+        try:
+            resume_state = RunState.load(args.resume)
+            args.resume_state = resume_state
+        except (OSError, ValueError) as e:
+            ap.error("cannot resume from %s: %s" % (args.resume, e))
+        clash = resume_state.conflicts_with(args.request, args.group,
+                                           args.service, args.raw_body or None)
+        if clash:
+            ap.error("--resume does not match this command (%s).  A mutant index "
+                     "only means something against the same model, so resuming "
+                     "into a different one would skip an unrelated part of the "
+                     "enumeration." % clash)
+        args.request = args.request or resume_state.request
+        if not args.request:
+            ap.error("%s does not record a request, so --request is needed"
+                     % args.resume)
+        if args.group is None:
+            args.group = resume_state.group
+        if args.service is None:
+            args.service = resume_state.service
+        if resume_state.raw_body:
+            args.raw_body = True
+        print("[resume] %s" % resume_state.describe())
+
+    # one seed per run, recorded so the run can be repeated
+    seed = set_run_seed(args.seed if args.seed is not None
+                        else (resume_state.seed if resume_state else
+                              run_seed()))
+    print("[seed] %d  (pass --seed %d to reproduce this run exactly)"
+          % (seed, seed))
 
     if args.from_pairs:
         return run_from_pairs(args)
@@ -317,17 +376,47 @@ def _surface_path(args, request_name, stamp):
                                              "service_surface.jsonl")
 
 
-def load_pairs(path, only="evidence"):
-    """Read a pair file into [(group, service)], deduped, best verdict wins.
+def group_fallbacks(path):
+    """{group: status} — the status each group answers for a service it lacks.
 
-    A pair file is append-only lines and a pair may appear more than once (a
-    later run can improve a verdict), so the last and best entry per pair is what
-    counts.  ``evidence`` keeps anything that replied; ``implemented`` keeps only
-    pairs whose reply carried content, which — calibrated against
-    CmpTraceMgr's ``trace_list`` — is what a service that really exists looks
-    like.
+    This is the whole discriminator, and it is **per group**: CmpAppBP and
+    CmpAppForce answer ``24`` (read straight off ``default: return 24`` in
+    ``sub_EBF300`` / ``sub_EC5900``), most others answer ``770``.  A group's
+    fallback is taken as the status it returns most often, which is safe because
+    a group has far more absent service ids than present ones.
+    """
+    counts = {}
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if row.get("verdict") != "refused" or row.get("status") is None:
+                continue
+            counts.setdefault(row["group"], {}).setdefault(row["status"], 0)
+            counts[row["group"]][row["status"]] += 1
+    return {g: max(c, key=c.get) for g, c in counts.items() if c}
+
+
+def load_pairs(path, only="evidence"):
+    """Read a pair file into [(group, service)], deduped.
+
+    ``evidence`` — anything that got a reply at all.
+
+    ``implemented`` — anything whose verdict is *not* the group's fallback
+    refusal.  That is deliberately broader than "the reply carried content",
+    which was the earlier rule and was wrong: measured against CmpAppBP, whose
+    nine services are known from the decompilation, "replied only" missed seven
+    of them.  Six of those seven answer with an **empty** body and one answers
+    ``refused`` with status ``1304`` — all of them present, none of them
+    ``refused/24``.  Keying on "not the fallback" got all nine and no absent id.
     """
     rank = {"accepted": 4, "replied": 3, "refused": 2, "empty": 1}
+    fallbacks = group_fallbacks(path) if only == "implemented" else {}
     best = {}
     with open(path, encoding="utf-8") as fh:
         for line in fh:
@@ -341,16 +430,88 @@ def load_pairs(path, only="evidence"):
             if "group" not in row or "service" not in row:
                 continue
             v = row.get("verdict", "no-reply")
-            if only == "implemented" and v not in ("replied", "accepted"):
-                continue
             if v not in rank:
                 continue
+            if only == "implemented":
+                is_fallback = (v == "refused"
+                               and row.get("status") == fallbacks.get(row["group"]))
+                if is_fallback:
+                    continue
             key = (row["group"], row["service"])
             # a pair can appear more than once (a later run improves a verdict),
             # so the best entry wins rather than the last
             if key not in best or rank[v] > rank[best[key]]:
                 best[key] = v
     return sorted((int(g, 16), int(s, 16)) for g, s in best)
+
+
+def _unhex_tree(nodes):
+    """Inverse of the recorder's hex encoding, dropping junk entries."""
+    out = []
+    for n in nodes or []:
+        try:
+            out.append({"id": int(n["id"], 16),
+                        "children": _unhex_tree(n.get("children"))})
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
+def describe_tree(nodes):
+    """``0x81(0x11 0x18) 0x1a`` — containers show their children."""
+    def one(n):
+        if n.get("children"):
+            return "0x%02x(%s)" % (n["id"],
+                                   " ".join(one(c) for c in n["children"]))
+        return "0x%02x" % n["id"]
+    return " ".join(one(n) for n in nodes) or "(empty)"
+
+
+def load_pair_tags(path):
+    """{(group, service): tag tree} — accepted-body seeds from a pair file.
+
+    The longest tree wins rather than the last: a pair is recorded again when its
+    verdict improves, and a later row is not necessarily a richer one (a run with
+    a different seed may have happened to carry fewer tags).  More nodes means
+    more is known about what that parser accepts.
+    """
+    out = {}
+    try:
+        fh = open(path, encoding="utf-8")
+    except OSError:
+        return out
+    with fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            try:
+                key = (int(row["group"], 16), int(row["service"], 16))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if "tag_tree" in row:
+                tree = _unhex_tree(row["tag_tree"])
+            elif "tags" in row:
+                # A pair file written before the tree format.  Those rows hold a
+                # flat id list, so they can only be read back as leaves — the
+                # container nesting is gone and cannot be recovered.  Better a
+                # partial seed than silently dropping the row, but this is why
+                # the format is a tree now.
+                tree = []
+                for t in row["tags"] or []:
+                    try:
+                        tree.append({"id": int(t, 16), "children": []})
+                    except (TypeError, ValueError):
+                        continue
+            else:
+                continue
+            if len(json.dumps(tree)) > len(json.dumps(out.get(key, []))):
+                out[key] = tree
+    return out
 
 
 def model_for_pair(group, service):
@@ -379,18 +540,28 @@ def run_from_pairs(args):
         print("[!] %s lists no usable pair (filter: %s)"
               % (args.from_pairs, args.pairs_only))
         return 2
+    seeds = load_pair_tags(args.from_pairs)
     print("========== targeted fuzz: %d pair(s) from %s =========="
           % (len(pairs), args.from_pairs))
+    print("  body seeds: %d pair(s) have recorded tag ids"
+          % len(seeds))
     results = []
     for i, (g, s) in enumerate(pairs, 1):
         model = model_for_pair(g, s)
         stamp = time.strftime("%m%d-%H%M%S")
         print("\n" + "#" * 72)
+        seed = seeds.get((g, s))
+        if model:
+            what = "model %s" % model
+        elif seed:
+            what = "seeded body from %s" % describe_tree(seed)
+        else:
+            what = "unstructured body (no model, no seeds)"
         print("# [%d/%d] group 0x%02x service 0x%04x  %s"
-              % (i, len(pairs), g, s,
-                 "model %s" % model if model else "generic body (no model)"))
+              % (i, len(pairs), g, s, what))
         print("#" * 72)
-        saved = (args.request, args.group, args.service, args.raw_body)
+        saved = (args.request, args.group, args.service, args.raw_body,
+                 getattr(args, "seed_tags", None))
         try:
             if model:
                 args.request, args.group, args.service = model, None, None
@@ -403,7 +574,8 @@ def run_from_pairs(args):
                 args.raw_body = True
             rc = run_one(args, args.request, stamp)
         finally:
-            args.request, args.group, args.service, args.raw_body = saved
+            (args.request, args.group, args.service, args.raw_body,
+             args.seed_tags) = saved
         results.append(((g, s), rc))
         if i < len(pairs):
             time.sleep(args.between_models)
@@ -520,6 +692,9 @@ def run_one(args, request_name, stamp):
                 raw_body=args.raw_body,
                 reply_timeout=args.reply_timeout,
                 surface_mode=args.surface,
+                seed_tags=getattr(args, "seed_tags", None),
+                crash_dir=args.log_dir, seed=run_seed(),
+                log_payloads=args.log_payloads,
                 surface_path=_surface_path(args, request_name, stamp))
 
     # build the connection, monitor and request model (no network yet)
@@ -537,9 +712,61 @@ def run_one(args, request_name, stamp):
 
     db_path = os.path.join(args.log_dir, "%s_%s.db" % (request_name, stamp))
 
+    # run state: resume at the first case that has not run, otherwise start fresh
+    state_path = args.state or os.path.join(
+        args.log_dir, "%s.state.json" % request_name)
+    state = getattr(args, "resume_state", None)
+    if state is not None:
+        nxt = state.resume_index()
+        if nxt is None:
+            print("[resume] %s is already complete (%s of %s cases)"
+                  % (args.resume, state.last_case, state.index_end))
+            return 0
+        index_start = nxt
+        state.path = state_path
+        state.index_end = index_end
+        state.db_file = db_path
+        print("[resume] continuing at case %d" % index_start)
+    else:
+        # Refuse to clobber a resumable state.  Starting a fresh run of a model
+        # whose previous run was interrupted is otherwise a silent way to throw
+        # that run's resume point away — and these runs are long enough that
+        # losing one to a mistyped command is worse than an extra flag.
+        # Not in batch modes: --all / --all-groups / --from-pairs mean "run each
+        # of these now", so refusing on the first stale state would just stall
+        # them.  In those the intent is explicit and the crash report carries
+        # everything needed to reproduce, so overwriting is the expected reading.
+        batching = bool(args.all or args.all_groups or args.from_pairs)
+        if os.path.exists(state_path) and not args.force_new and not batching:
+            try:
+                old = RunState.load(state_path)
+            except (OSError, ValueError):
+                old = None
+            if old is not None and (old.last_case or 0) > 0:
+                print("[!] %s already holds a run of %s stopped at case %s "
+                      "of %s" % (state_path, old.request, old.last_case,
+                                 old.index_end))
+                print("    Resume it:      --resume %s" % state_path)
+                print("    Or keep it and start elsewhere:  --state <other.json>")
+                print("    Or discard it:  --force-new")
+                return 2
+        state = RunState(path=state_path, request=request_name,
+                         group=args.group, service=args.service,
+                         raw_body=bool(args.raw_body), seed=run_seed(),
+                         index_start=index_start, index_end=index_end,
+                         db_file=db_path)
+    state.save()
+
     fz._init_session(db_filename=db_path, index_start=index_start,
                      index_end=index_end,
                      web_port=None if args.no_web else args.web_port)
+    fz.state = state
+    fz.state_every = args.state_every
+    # the db path is only known once the stamp is chosen, and the monitor needs
+    # it for the crash report
+    fz.db_path = db_path
+    if fz.monitor is not None:
+        fz.monitor.db_path = db_path
 
     print("========== CODESYS V3 fuzzer ==========")
     print("  target   : %s:%d" % (args.target, args.port))
@@ -555,6 +782,9 @@ def run_one(args, request_name, stamp):
                                if index_end else "all"))
     print("  probe    : %s" % ("off" if args.no_probe
                                else "every %d case(s)" % args.probe_every))
+    print("  cases    : %s..%s" % (index_start, index_end or "all"))
+    print("  seed     : %d" % run_seed())
+    print("  state    : %s" % state_path)
     print("  db       : %s" % db_path)
     if not args.no_web:
         print("  web ui   : http://localhost:%d/" % args.web_port)

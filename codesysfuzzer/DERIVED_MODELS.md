@@ -73,12 +73,41 @@ CmpAppBP's remaining service ids — read but **not yet modelled**: `0x22`, `0x3
 Models live in `services.py` under the "Derived from decompilation" heading, and
 are registered in `REQUESTS`.
 
-## Not verified yet
+## Verified against the live runtime
 
-**None of the six has been confirmed against a live runtime.** The check is
-cheap and worth doing first: `--dry-run --send` for each, and confirm the reply
-is *not* group 0x12's `default: return 24`. A `24` means the service id was
-misread. The runtime was stopped when this was written.
+`--dry-run --send` for each, checking the reply is not the group's
+`default: return 24` — which is exactly what a misread service id produces:
+
+| model | reply | |
+|---|---|---|
+| `appbp_0x13_setbp` | group 0x12 service 0x13, content | ok |
+| `appbp_0x15_delbp` | group 0x12 service 0x15, content | ok |
+| `appbp_0x16` | group 0x12 service 0x16, content 4B | ok |
+| `appbp_0x19` | group 0x12 service 0x19, content 4B | ok |
+| `appbp_0x39` | group 0x12 service 0x39, content 4B | ok |
+| `appforce_0x81_11` | group 0x13 service 0x01, **status 24** | **wrong id** |
+
+The CmpAppForce one failed exactly as the check is designed to catch: its service
+id was a placeholder (only its tags had been derived). Reading the group handler
+`sub_EC5900` gave the real ids — `0x20`, `0x21`, `0x41` — and all three were then
+confirmed. The models are now `appforce_0x20` / `_0x21` / `_0x41`.
+
+**The tag ids were cross-checked independently.** Fuzzing `appbp_0x39` while the
+pair recorder was on produced
+
+```json
+{"group": "0x0012", "service": "0x0039", "verdict": "replied",
+ "tag_tree": [{"id": "0x11", ...}, {"id": "0x18", ...}]}
+```
+
+— tags 0x11 and 0x18, which is what decompiling `sub_EBF300` case 0x39 predicted
+(`if (v12 == 17) … else if (v12 == 24)`). The static reading and the live runtime
+agree, so the method is sound and the remaining groups can be trusted to it.
+
+**Lesson worth keeping:** deriving the tags is not enough — read the group
+handler's switch for the service ids too, and always `--dry-run --send` a new
+model. The check takes a second and it is the only thing that separates a correct
+service id from a plausible-looking one.
 
 ## Remaining work
 

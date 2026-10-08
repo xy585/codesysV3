@@ -22,12 +22,40 @@ render time by ``FrameEncoder``.
 
 import struct
 
-from boofuzz import Session, Target
+from boofuzz import FuzzLoggerText, Session, Target
 
 from monitor import CodesysMonitor
 from services import build_request, request_names
 from transport import CodesysConnection
 from utils import _s_update
+
+
+class NoPayloadLogger(FuzzLoggerText):
+    """``FuzzLoggerText`` that logs how big a payload was, not what it was.
+
+    Subclassed rather than configured because boofuzz's ``bytes_to_str``
+    parameter is dead in 0.4.2: ``_print_log_msg`` calls
+    ``helpers.format_log_msg`` without passing it, so the value is stored on the
+    logger and never used.  Overriding the two methods that carry payload is the
+    honest way to get the behaviour the parameter advertises.
+
+    The line is kept so a run trace is still readable — it says a request went
+    out and how big it was — while the bytes themselves are not written anywhere
+    except the crash report, where they are actually needed.
+    """
+
+    @staticmethod
+    def _summary(data):
+        try:
+            return "%d bytes, not logged (see the crash report)" % len(data)
+        except TypeError:
+            return "payload not logged"
+
+    def log_send(self, data):
+        self._print_log_msg(msg=self._summary(data), msg_type="info")
+
+    def log_recv(self, data):
+        self._print_log_msg(msg=self._summary(data), msg_type="info")
 
 
 class Fuzzer(object):
@@ -37,7 +65,9 @@ class Fuzzer(object):
                  timeout=5.0, probe_every=1, probe=True, verbose=False,
                  sleep_time=0.0, restart_threshold=1,
                  group=None, service=None, raw_body=False, surface_path=None,
-                 surface_mode="global",
+                 surface_mode="global", state=None, state_every=25, seed_tags=None,
+                 crash_dir=None, seed=None, db_path=None,
+                 log_payloads=False,
                  reply_timeout=2.0, **connection_kwargs):
         self.target_ip = target_ip
         self.target_port = target_port
@@ -56,6 +86,13 @@ class Fuzzer(object):
         self.raw_body = raw_body
         self.surface_path = surface_path
         self.surface_mode = surface_mode
+        self.seed_tags = seed_tags
+        self.seed = seed
+        self.db_path = db_path
+        self.crash_dir = crash_dir
+        self.log_payloads = log_payloads
+        self.state = state
+        self.state_every = max(1, state_every)
         self.reply_timeout = reply_timeout
         self.connection_kwargs = connection_kwargs
 
@@ -84,6 +121,11 @@ class Fuzzer(object):
                                       verbose=self.verbose,
                                       surface_path=self.surface_path,
                                       surface_mode=self.surface_mode,
+                                      crash_dir=self.crash_dir,
+                                      request_name=self.request_name,
+                                      target=self.target_ip,
+                                      seed=self.seed,
+                                      db_path=self.db_path,
                                       reply_timeout=self.reply_timeout)
         self.target = Target(connection=self.connection,
                              monitors=[self.monitor])
@@ -113,13 +155,25 @@ class Fuzzer(object):
         # point, which turns a second run into "0 cases, no error".
         # web_port=None must go in here, not be assigned afterwards: Session.__init__
         # starts the web thread, so clearing the port later leaves it running.
+        # Payloads are NOT logged by default.  boofuzz's text logger prints the
+        # full hex of every transmitted request, and the sqlite database stores
+        # the first 512 bytes of each; over a long run that is a copy of the
+        # entire corpus, which nothing here needs.  What needs to be kept is the
+        # one request that caused a crash, and that is written by the monitor
+        # when it happens.  --log-payloads restores the full hex for debugging.
+        loggers = None
+        if not self.log_payloads:
+            loggers = [NoPayloadLogger()]
+
         self.session = Session(
+            fuzz_loggers=loggers,
             db_filename=db_filename,
             index_start=index_start,
             index_end=index_end,
             web_port=web_port,
             keep_web_open=False,
             pre_send_callbacks=[self.session_pre_send],
+            post_test_case_callbacks=[self.session_post_test_case],
             restart_threshold=self.restart_threshold,
             ignore_connection_reset=True,
             ignore_connection_aborted=True,
@@ -131,10 +185,20 @@ class Fuzzer(object):
         )
         self.session.add_target(self.target)
 
+        # the sqlite logger keeps the first 512 bytes of every send and receive
+        # by default, which over a run is the whole corpus; zeroing the limit
+        # leaves the case/pass/fail record, which is what the database is for
+        if not self.log_payloads:
+            db_logger = getattr(self.session, "_db_logger", None)
+            if db_logger is not None and hasattr(db_logger,
+                                                 "_data_truncate_length"):
+                db_logger._data_truncate_length = 0
+
     def _init_protocol_structure(self):
         self.request = build_request(self.request_name, self.connection.state,
                                      group=self.group, service=self.service,
-                                     raw_body=self.raw_body)
+                                     raw_body=self.raw_body,
+                                     seed_tags=self.seed_tags)
 
     def init(self):
         self._init_target_connection()
@@ -167,6 +231,23 @@ class Fuzzer(object):
                 "request %r has no unique 'session_id' field — the packet would "
                 "go out with placeholder bytes" % self.request_name)
 
+    def session_post_test_case(self, target, fuzz_data_logger, session,
+                               sock=None, **kwargs):
+        """Record progress so an interrupted run can resume.
+
+        boofuzz's ``total_mutant_index`` is the same numbering ``--cases`` and
+        ``--case`` use, so it is what gets written.  Saving every case would
+        dominate the cost of a fast model, hence the interval; the state is also
+        written once when the run ends, in ``fuzz`` and in the CLI's error paths.
+        """
+        if self.state is None:
+            return
+        self.state.cases_run += 1
+        self.state.last_case = getattr(session, "total_mutant_index",
+                                       self.state.last_case)
+        if self.state.cases_run % self.state_every == 0:
+            self.state.save()
+
     def pre_actions(self):
         return True
 
@@ -193,7 +274,11 @@ class Fuzzer(object):
         # open() is idempotent, so boofuzz's own open() is then a no-op rather
         # than a second handshake.
         self.connection.open()
-        self.session.fuzz()
+        try:
+            self.session.fuzz()
+        finally:
+            if self.state is not None:
+                self.state.save()
 
 
 __all__ = ["Fuzzer", "request_names"]

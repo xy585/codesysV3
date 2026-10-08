@@ -118,6 +118,69 @@ Three rules make the file usable as an input rather than a report:
   indistinguishable from one of runs that found nothing. `--surface off` writes
   no file at all.
 
+### Reproducibility: one seed per run, recorded
+
+boofuzz's `RandomData` hardcodes `random.Random(0)` in `mutations()`, commented
+as being for reproducible test cases. That is not reproducibility, it is a fixed
+corpus: **run the same model twice and byte-for-byte identical payloads go out
+the second time.** The seed belongs to the run, so this fuzzer draws from a
+per-run seed (`RunRandom`), mixed with each primitive's name so two primitives in
+one run do not move together:
+
+```
+[seed] 4242  (pass --seed 4242 to reproduce this run exactly)
+```
+
+`--seed` pins it; otherwise one is generated and written to the run state file.
+Same seed reproduces a run exactly, a different seed explores different bytes.
+
+### Resuming an interrupted run
+
+`--state` (default `<log-dir>/<request>.state.json`) records the request, the
+group/service, **the seed**, and the last case reached, saved every
+`--state-every` cases (default 25) and once more when the run ends:
+
+```
+python codesysfuzzer/codesys_fuzzer.py <target> -r trace_configure --cases 5000
+    ... interrupted ...
+python codesysfuzzer/codesys_fuzzer.py <target> --resume logs/trace_configure.state.json
+```
+
+It continues at the first case that has not run, with the recorded seed, instead
+of repeating what already ran. Resuming with a *different* model is refused
+rather than silently resuming into the middle of an unrelated enumeration — a
+mutant index only means something against the same request. The file is written
+to a temp sibling and replaced, so an interrupt cannot leave a half-written index
+behind.
+
+This is deliberately **not** boofuzz's `session_filename`: that is an opaque
+zlib+pickle blob which sets `_index_start` to whatever it finds, and pointing it
+at the wrong path silently turns a run into "0 cases, no error" — see
+*Findings* below.
+
+### Body seeds: what the runtime actually accepted
+
+A pair file that says "0x12/0x39 answered" is a lead; one that says "0x12/0x39
+answered when the body carried container 0x81 holding tags 0x11 and 0x18" is a
+*seed*. So each recorded pair also carries the tag structure of the request that
+drew the reply:
+
+```json
+{"group": "0x0012", "service": "0x0039", "verdict": "replied",
+ "tag_tree": [{"id": "0x81", "children": [{"id": "0x11", "children": []},
+                                          {"id": "0x18", "children": []}]}]}
+```
+
+Nesting is kept and container ids keep bit 7, because a flat list of ids cannot
+rebuild a body — `parse_tags` masks bit 7, so container `0x81` reads back as
+`0x01` and rebuilding from that emits it as a *leaf*, producing a body the
+handler never walks into.
+
+`--from-pairs` then uses them, in this order of preference: **a model if one
+exists**, else **a body rebuilt from the recorded structure**, else an
+unstructured blob. Nothing is recorded for a dropped packet, since the body says
+nothing about what was accepted.
+
 ### Fuzzing a pair list
 
 `--from-pairs FILE` turns a pair file back into work:

@@ -81,25 +81,42 @@ def main():
         key = (row["group"], row["service"])
         per[key][(row.get("verdict"), row.get("status"))] += 1
 
-    def verdict_of(counter):
-        """The strongest verdict seen for a pair, best first."""
-        for want in ("replied", "accepted"):
+    # What each group answers for a service it does not have.  This is *per
+    # group*: measured on CmpAppBP and CmpAppForce it is 24 (read straight off
+    # `default: return 24` in sub_EBF300 / sub_EC5900), on most others 770.  So
+    # "refused" alone says nothing — only "refused with the group's own fallback"
+    # means the service is absent.  A group has far more absent ids than present
+    # ones, so the most common refusal status is the fallback.
+    by_group = collections.defaultdict(collections.Counter)
+    for (g, _s), c in per.items():
+        for (v, st), n in c.items():
+            if v == "refused" and st is not None:
+                by_group[g][st] += n
+    fallback = {g: c.most_common(1)[0][0] for g, c in by_group.items() if c}
+
+    def verdict_of(counter, group):
+        """The strongest verdict seen for a pair, best first.
+
+        ``empty`` counts as present: six of CmpAppBP's nine real services answer
+        with a zero-length body to a body they cannot use, and treating that as
+        "absent" dropped them.  Anything that is not the group's fallback refusal
+        is evidence the handler is there.
+        """
+        for want in ("replied", "accepted", "empty"):
             if any(k[0] == want for k in counter):
-                return want
+                return "present" if want == "empty" else want
         for (v, st), _n in counter.most_common():
-            if v == "refused" and st != NO_SUCH_SERVICE:
+            if v == "refused" and st is not None and st != fallback.get(group):
                 return "refused-specific"
         if any(k[0] == "refused" for k in counter):
-            return "refused"
-        if any(k[0] == "empty" for k in counter):
-            return "empty"
+            return "refused-fallback"
         return "no-reply"
 
     implemented, specific, groups_seen = [], [], set()
     for (g, s), c in per.items():
         groups_seen.add(g)
-        v = verdict_of(c)
-        if v in ("replied", "accepted"):
+        v = verdict_of(c, g)
+        if v in ("replied", "accepted", "present"):
             implemented.append((g, s))
         elif v == "refused-specific":
             st = [k[1] for k in c if k[0] == "refused" and k[1] != NO_SUCH_SERVICE]
@@ -107,9 +124,15 @@ def main():
 
     print("\n========== service map ==========")
     print("  groups probed          : %d" % len(groups_seen))
+    print("  per-group fallbacks    : %s"
+          % " ".join("%s->%s" % (g, fallback.get(g, "?"))
+                     for g in sorted(fallback)) or "(none)")
     print("  (group, service) pairs : %d" % len(per))
-    print("  IMPLEMENTED (content)  : %d" % len(implemented))
-    print("  refused, non-770 status: %d  <- handlers that ran and decided"
+    print("  IMPLEMENTED            : %d  (content or empty reply: the handler"
+          % len(implemented))
+    print("                            is there and answered)"
+          if implemented else "")
+    print("  refused, non-fallback  : %d  <- a handler that ran and decided"
           % len(specific))
 
     by_group = collections.defaultdict(list)

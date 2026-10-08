@@ -27,11 +27,13 @@ Verified against boofuzz 0.4.2 source:
     used below and both are what the protocol wants.
 """
 
+import random
 import struct
 import zlib
 
 from boofuzz import blocks, s_block, s_group, s_initialize, s_random, s_static
 from boofuzz.blocks import Size
+from boofuzz.primitives.random_data import RandomData
 
 from proto import (
     DATAGRAM_HEADER, DATAGRAM_MAGIC, HDR_PREFIX_WORDS, PKT_INFO, PROTO_TAG,
@@ -144,6 +146,80 @@ def s_leb_size(block_name, name=None, fuzzable=False, math=None, width=3):
         length=width, fuzzable=fuzzable, math=math))
 
 
+# ============================================================
+# Seeded randomness
+# ============================================================
+#
+# boofuzz's RandomData hardcodes ``random.Random(0)`` in ``mutations()``, with a
+# comment saying it is for reproducible test cases.  It is not reproducibility,
+# it is a fixed corpus: run the same model twice and byte-for-byte identical
+# payloads go out the second time.  The seed is a *property of the run*, so a run
+# that wants to be repeatable should record the seed it used — not one primitive
+# silently always reusing zero.
+#
+# So: one seed per run, mixed with the primitive's own name to give each
+# primitive a distinct but reproducible stream.  Pass ``--seed`` to fix it, or
+# read it out of the run state file afterwards.
+
+_RUN_SEED = None
+
+
+def set_run_seed(seed):
+    """Pin the run's seed.  Recorded in the run state so a run is repeatable."""
+    global _RUN_SEED
+    _RUN_SEED = int(seed) & 0xFFFFFFFF
+    return _RUN_SEED
+
+
+def run_seed():
+    """The run's seed, generated on first use if none was given."""
+    global _RUN_SEED
+    if _RUN_SEED is None:
+        _RUN_SEED = random.SystemRandom().randrange(1 << 32)
+    return _RUN_SEED
+
+
+def stream_seed(name):
+    """A stable per-primitive seed.
+
+    ``crc32`` rather than ``hash()`` because ``hash`` is salted per process for
+    strings, which would make the same run seed give different bytes on a rerun —
+    exactly the property being fixed here.
+    """
+    return (run_seed() ^ (zlib.crc32(name.encode("utf-8")) & 0xFFFFFFFF)) \
+        & 0xFFFFFFFF
+
+
+class RunRandom(RandomData):
+    """``RandomData`` seeded per run instead of per call site.
+
+    Same mutation shape as upstream — ``max_mutations`` values whose length walks
+    ``min_length + i * step`` when a ``step`` is given, or is drawn uniformly
+    otherwise — but the bytes come from :func:`stream_seed`, so two runs of the
+    same model send different payloads and the same run seed reproduces them.
+    """
+
+    def mutations(self, default_value):
+        name = self.qualified_name or self.name or "?"
+        rnd = random.Random(stream_seed(name))
+        for i in range(self.get_num_mutations()):
+            if self.step:
+                length = self.min_length + i * self.step
+            else:
+                length = rnd.randint(self.min_length, self.max_length)
+            yield bytes(rnd.randrange(256) for _ in range(length))
+
+
+def s_run_random(default_value, min_length=0, max_length=1, max_mutations=25,
+                 step=None, name=None):
+    """``s_random`` with the run's seed.  Use this instead of ``s_random``."""
+    # no request= here: RandomData forwards its kwargs to Fuzzable, which has no
+    # such parameter (Size does, which is why the sizers above take one)
+    blocks.CURRENT.push(RunRandom(
+        name=name, default_value=default_value, min_length=min_length,
+        max_length=max_length, max_mutations=max_mutations, step=step))
+
+
 def s_lying_leb_size(block_name, name=None):
     """A fuzzable declared length that may disagree with the block it names."""
     blocks.CURRENT.push(LyingLeb128Size(
@@ -164,8 +240,8 @@ def s_tagged(tag_id, block_name, filler=b"\x00", min_length=0, max_length=None,
         if max_length is None:
             s_static(filler)
         else:
-            s_random(filler, min_length=min_length, max_length=max_length,
-                     name=block_name + "_data")
+            s_run_random(filler, min_length=min_length,
+                         max_length=max_length, name=block_name + "_data")
 
 
 def s_u32_tag(tag_id, value, name=None):
@@ -459,7 +535,8 @@ __all__ = [
     "Leb128Size", "LyingLeb128Size", "FrameEncoder", "s_leb_size",
     "s_lying_leb_size", "s_tagged",
     "s_u32_tag", "s_container", "s_initialize", "s_block", "s_group",
-    "s_random", "s_static", "request_skeleton", "datagram_header",
+    "s_random", "s_run_random", "RunRandom", "set_run_seed", "run_seed",
+    "stream_seed", "s_static", "request_skeleton", "datagram_header",
     "_s_update", "GROUP_NAMES", "GROUP_IDS", "SERVICE_IDS_SWEEP", "TAG_VALUES",
     "LENGTH_VALUES", "OVERSIZE_VALUES", "datagram_header", "leb128_pad",
     "FRAME_DATA_FIRST", "FRAME_DATA_CONT", "LEB128_3_MAX", "LEB128_2_MAX",

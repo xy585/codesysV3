@@ -20,6 +20,7 @@ here.  Budget a few probes per second at most: each one is a full TCP handshake
 to the same service the fuzzer is hammering.
 """
 
+import collections
 import json
 import os
 import struct
@@ -33,30 +34,82 @@ from proto import (
 )
 
 
-def parse_sent(data):
-    """Pull the (group, service) actually transmitted out of a sent frame.
+def parse_sent_parts(data):
+    """``(group, service, body)`` for a sent frame, or ``(None, None, None)``.
 
     Needed because in a sweep the ids that went out are the *mutated* ones, not
     the model's defaults — reading them back off the wire is simpler and more
     trustworthy than threading the mutation context through.  Only the first
-    frame is inspected; the services header is in it either way.
+    frame is inspected; the services header and the start of the body are in it
+    either way.
     """
     if not data or len(data) < 8 + 20:
-        return None, None
+        return None, None, None
     try:
         magic, length = struct.unpack_from("<II", data, 0)
         if magic != BD_MAGIC or length < 8 or length > len(data):
-            return None, None
+            return None, None, None
         dg = parse_datagram(data[8:length])
         if dg is None:
-            return None, None
+            return None, None, None
         ch = parse_channel(dg["payload"])
         if ch.get("type") not in ("blk_first", "blk_cont"):
-            return None, None
-        hdr, _ = parse_services(ch["data"])
-        return hdr["group"], hdr["service_id"]
+            return None, None, None
+        hdr, body = parse_services(ch["data"])
+        return hdr["group"], hdr["service_id"], body
     except (ValueError, struct.error, KeyError, IndexError):
-        return None, None
+        return None, None, None
+
+
+def parse_sent(data):
+    """``(group, service)`` for a sent frame, or ``(None, None)``."""
+    group, service, _body = parse_sent_parts(data)
+    return group, service
+
+
+def body_seed_tags(sent, limit=24):
+    """The tag structure a *sent* request carried, as a nested wire-id tree.
+
+    This is the difference between a pair file that says "0x12/0x39 answered"
+    and one that says "0x12/0x39 answered when the body carried container 0x81
+    holding tags 0x11 and 0x18".  The second is a usable seed: it is the only
+    evidence available about what that service's parser accepts, and it is what
+    lets a later run for the same pair stop sending unstructured bytes.
+
+    **A flat list of ids will not do.**  ``parse_tags`` masks bit 7 off a tag id,
+    so container ``0x81`` is reported as id ``0x01`` — and rebuilding from that
+    would emit ``0x01`` as a leaf, producing a body the handler never walks into.
+    So the nesting is preserved and the id is restored to its *wire* form
+    (container ids carry bit 7), which is what has to be written back out.
+
+    Returns ``[{"id": int, "children": [...]}, ...]``.
+    """
+    _g, _s, body = parse_sent_parts(sent)
+    if not body:
+        return []
+    budget = [limit]
+
+    def walk(tags):
+        out = []
+        for t in tags:
+            if budget[0] <= 0:
+                break
+            budget[0] -= 1
+            wire = (t["id"] | 0x80) if t["children"] else t["id"]
+            out.append({"id": wire,
+                        "children": walk(t["children"]) if t["children"] else []})
+        return out
+
+    try:
+        return walk(parse_tags(body))
+    except ValueError:
+        return []
+
+
+def _hex_tree(nodes):
+    """The tree with ids as hex strings, so the file stays readable."""
+    return [{"id": "0x%02x" % n["id"], "children": _hex_tree(n["children"])}
+            for n in nodes]
 
 
 class SurfaceRecorder(object):
@@ -99,6 +152,7 @@ class SurfaceRecorder(object):
         self.verbose = verbose
         self.fh = None                       # opened on first write, never before
         self.written = 0
+        self.tally = {}         # (group, service) -> Counter of verdicts
         self.seen = {}          # (group, service) -> verdict
         self.status = {}        # (group, service) -> last status seen
         self.counts = {"accepted": 0, "refused": 0, "replied": 0, "empty": 0,
@@ -212,6 +266,7 @@ class SurfaceRecorder(object):
 
         self.counts[verdict] += 1
         key = (group, service)
+        self.tally.setdefault(key, collections.Counter())[verdict] += 1
         previous = self.seen.get(key)
         # keep the most informative verdict for a pair: a refusal proves the
         # dispatch path exists, a later no-reply does not disprove it
@@ -231,9 +286,27 @@ class SurfaceRecorder(object):
         # already in the file — so repeated runs extend it rather than repeat it.
         improved = (self.RANK.get(verdict, 0)
                     > self.RANK.get(previous or "", 0))
+        # The tag ids the request carried.  This is what turns "0x12/0x39
+        # answered" into "0x12/0x39 answered when the body carried tags 0x11 and
+        # 0x18" — the only evidence available about what that parser accepts, and
+        # what lets a later run for the same pair send a shaped body instead of
+        # garbage.  Recorded only for replies that are evidence, because for a
+        # dropped packet the body says nothing about what was accepted.
+        seeds = body_seed_tags(sent) if verdict in ("replied", "accepted") else []
         row = {"group": "0x%04x" % group, "service": "0x%04x" % service,
                "verdict": verdict, "status": status,
                "first_seen": time.strftime("%Y-%m-%dT%H:%M:%S")}
+        if seeds:
+            row["tag_tree"] = _hex_tree(seeds)
+        # How the cases for this pair actually split.  The row records the *best*
+        # verdict, so a pair that replied once and was refused twenty times would
+        # otherwise look as healthy as one that replied every time — and the
+        # reader has no way to tell.  One counter makes that visible.
+        tally = self.tally.get(key)
+        if tally and len(tally) > 1:
+            row["verdicts"] = dict(tally)
+        elif tally:
+            row["cases"] = sum(tally.values())
         worth_writing = (verdict != "no-reply"
                          and (is_new or (self.mode == "global" and improved)))
         if worth_writing:
@@ -300,7 +373,9 @@ class CodesysMonitor(BaseMonitor):
     """
 
     def __init__(self, connection, probe_every=1, enabled=True, verbose=False,
-                 surface_path=None, reply_timeout=2.0, surface_mode="global"):
+                 surface_path=None, reply_timeout=2.0, surface_mode="global",
+                 crash_dir=None, request_name=None, target=None, seed=None,
+                 db_path=None):
         super().__init__()
         self.connection = connection
         self.probe_every = max(1, probe_every)
@@ -308,6 +383,11 @@ class CodesysMonitor(BaseMonitor):
         self.verbose = verbose
         self.surface = SurfaceRecorder(path=surface_path, verbose=verbose,
                                        mode=surface_mode)
+        self.crash_dir = crash_dir
+        self.request_name = request_name
+        self.target = target
+        self.seed = seed
+        self.db_path = db_path
         self.reply_timeout = reply_timeout
 
         self.cases = 0
@@ -387,11 +467,109 @@ class CodesysMonitor(BaseMonitor):
             "when": time.strftime("%Y-%m-%d %H:%M:%S"),
             "send_len": len(self._last_send) if self._last_send else 0,
         }
+        self._write_crash_files()
         if fuzz_data_logger is not None:
             fuzz_data_logger.log_fail(
                 "CODESYS runtime is gone after case %s: %s"
                 % (self._last_case_index, why))
+            if self.crash.get("files"):
+                fuzz_data_logger.log_info("crash report written to %s.txt / .json"
+                                          % self.crash["files"])
         return False
+
+    def _write_crash_files(self):
+        """Land the crash on disk the moment it is detected.
+
+        Written as soon as the probe fails rather than at the end of the run,
+        because the interesting case is exactly the one where the run does not
+        continue, and a report that only appears in a summary is a report that a
+        killed process never writes.
+
+        The raw bytes matter here specifically because **boofuzz's database
+        truncates them**: its ``send`` steps are capped (measured at 512 bytes,
+        flagged ``is_truncated``), so for anything larger than one datagram the
+        database holds only the first frame.  This file is the authoritative
+        copy of what was sent.
+        """
+        if not self.crash_dir or not self._last_send:
+            return None
+        stamp = time.strftime("%m%d-%H%M%S")
+        base = os.path.join(self.crash_dir,
+                            "%s_crash_%s" % (self.request_name or "run", stamp))
+        struct = structured_request(self._last_send)
+        case = self.crash.get("case")
+
+        cmd = ("python codesysfuzzer/codesys_fuzzer.py %s -r %s --case %s "
+               "--seed %s --surface off"
+               % (self.target or "<target>", self.request_name or "<request>",
+                  case, self.seed))
+
+        lines = [
+            "CODESYS V3 fuzzer - crash report",
+            "=" * 68,
+            "  when        : %s" % self.crash.get("when"),
+            "  target      : %s" % (self.target or "?"),
+            "  request     : %s" % (self.request_name or "?"),
+            "  case        : %s   (boofuzz total_mutant_index)" % case,
+            "  cases run   : %s" % self.crash.get("cases_run"),
+            "  detector    : %s" % self.crash.get("reason"),
+            "  request size: %d bytes as sent" % len(self._last_send),
+            "  seed        : %s" % self.seed,
+            "  database    : %s" % (self.db_path or "?"),
+            "",
+            "Reproduce",
+            "-" * 68,
+            "  %s" % cmd,
+            "",
+            "  The seed is required: the random parts of a request come from the",
+            "  run's seed, so the same case index with a different seed sends",
+            "  different bytes.  --surface off keeps the replay out of the pair",
+            "  file.  Do not use --resume for this: it continues at the next case",
+            "  and skips this one.",
+            "",
+            "Structured request (group / service / tags)",
+            "-" * 68,
+        ]
+        if struct:
+            lines.append("  group 0x%04x  service 0x%04x"
+                         % (struct["group"], struct["service"]))
+            if "parse_error" in struct:
+                lines.append("  body did not parse: %s" % struct["parse_error"])
+                lines.append("  body hex: %s" % struct["body_hex"])
+            else:
+                lines.extend(_fmt_nodes(struct["body"], 1))
+        else:
+            lines.append("  (the sent frame did not parse as a services request)")
+        lines += [
+            "",
+            "Raw bytes (block driver + datagram + channel frames + services)",
+            "-" * 68,
+            "  note: the sqlite database truncates this at 512 bytes; this file",
+            "        does not, so it is the copy to keep",
+            "",
+            _hexdump(self._last_send, limit=len(self._last_send)),
+            "",
+        ]
+
+        with open(base + ".txt", "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines))
+        with open(base + ".json", "w", encoding="utf-8") as fh:
+            json.dump({
+                "when": self.crash.get("when"),
+                "target": self.target,
+                "request": self.request_name,
+                "case": case,
+                "cases_run": self.crash.get("cases_run"),
+                "detector": self.crash.get("reason"),
+                "seed": self.seed,
+                "database": self.db_path,
+                "reproduce_command": cmd,
+                "sent_bytes": len(self._last_send),
+                "sent_hex": self._last_send.hex(),
+                "structured": struct,
+            }, fh, indent=2)
+        self.crash["files"] = base
+        return base
 
     def get_crash_synopsis(self):
         if self.crash is None:
@@ -425,6 +603,57 @@ class CodesysMonitor(BaseMonitor):
             return None
         return ("crash case=%s detector=%s"
                 % (self.crash["case"], self.crash["reason"])).encode()
+
+
+def structured_request(sent):
+    """The sent request as a nested tag tree with values, for a crash report.
+
+    ``{"group": int, "service": int, "body": [node, ...]}`` where a node is
+    ``{"id": int, "container": bool, "value": bytes, "children": [...]}``.  This
+    is the "simplified" form: the same bytes as the hexdump, but arranged the way
+    the handler reads them, so a reader can see which tag held the oversized
+    value without decoding LEB128 by hand.
+    """
+    group, service, body = parse_sent_parts(sent)
+    if group is None:
+        return None
+
+    def node(t):
+        # wire id: parse_tags masks bit 7, so a container 0x86 arrives as 0x06.
+        # The report has to show the byte that goes on the wire or it cannot be
+        # copied back into a body.
+        return {"id": (t["id"] | 0x80) if t["children"] else t["id"],
+                "container": bool(t["children"]),
+                "value_hex": t["value"].hex(),
+                "value_len": len(t["value"]),
+                "children": [node(c) for c in t["children"]] if t["children"]
+                else []}
+
+    try:
+        tags = parse_tags(body)
+    except ValueError as e:
+        return {"group": group, "service": service, "parse_error": str(e),
+                "body_hex": body.hex()}
+    return {"group": group, "service": service, "body": [node(t) for t in tags]}
+
+
+def _fmt_nodes(nodes, indent=0):
+    """``0x81(0x11=00000000 0x18=00000000)`` across several lines."""
+    pad = "  " * indent
+    out = []
+    for n in nodes:
+        raw = bytes.fromhex(n["value_hex"])
+        head = "%s0x%02x" % (pad, n["id"])
+        if n["children"]:
+            out.append("%s  (container, %d byte(s) of children)"
+                       % (head, n["value_len"]))
+            out.extend(_fmt_nodes(n["children"], indent + 2))
+            continue
+        asc = "".join(chr(b) if 32 <= b < 127 else "." for b in raw[:16])
+        shown = " ".join("%02x" % b for b in raw[:24]) or "(empty)"
+        out.append("%s  = %s  |%s|  (%d byte(s))"
+                   % (head, shown, asc, n["value_len"]))
+    return out
 
 
 def _hexdump(data, width=16, limit=512):

@@ -37,12 +37,12 @@ frames as it takes, which is the ceiling the UDP PoC could not get past.
 
 import struct
 
-from boofuzz import s_group, s_random, s_static
+from boofuzz import s_group, s_static
 
 from proto import tag
 from utils import (
     GROUP_IDS, SERVICE_IDS_SWEEP, TAG_VALUES, request_skeleton, s_block,
-    s_container, s_leb_size, s_lying_leb_size,
+    s_container, s_leb_size, s_lying_leb_size, s_run_random,
 )
 
 #: deterministic growth sweep for the memcpy destinations.  Step 64 means the
@@ -61,7 +61,7 @@ def _s_value_tag(tag_id, block_name, default, max_length=None):
     s_static(bytes([tag_id]))
     s_leb_size(block_name)
     with s_block(block_name):
-        s_random(default, min_length=len(default),
+        s_run_random(default, min_length=len(default),
                  max_length=max_length if max_length is not None else len(default),
                  name=block_name + "_data")
 
@@ -78,7 +78,7 @@ def _s_grow_tag(tag_id, block_name, default, sweep=None):
     s_static(bytes([tag_id]))
     s_leb_size(block_name)
     with s_block(block_name):
-        s_random(default, min_length=len(default),
+        s_run_random(default, min_length=len(default),
                  max_length=sweep["max_length"], step=sweep["step"],
                  name=block_name + "_data")
 
@@ -162,7 +162,7 @@ def body_trace_configure_liar():
         s_static(bytes([tag_id]))
         s_lying_leb_size(block_name)
         with s_block(block_name):
-            s_random(default, min_length=len(default), max_length=64,
+            s_run_random(default, min_length=len(default), max_length=64,
                      name=block_name + "_data")
 
 
@@ -247,14 +247,14 @@ def body_generic_tags():
     s_group(values=TAG_VALUES, name="tag0_id")
     s_leb_size("tag0")
     with s_block("tag0"):
-        s_random(b"\x00\x00\x00\x00", min_length=0, max_length=256,
+        s_run_random(b"\x00\x00\x00\x00", min_length=0, max_length=256,
                  name="tag0_data")
 
     # tag 1: fuzzable id, and a declared length free to disagree with the content
     s_group(values=TAG_VALUES, name="tag1_id")
     s_lying_leb_size("tag1")
     with s_block("tag1"):
-        s_random(b"\x00\x00\x00\x00", min_length=0, max_length=64,
+        s_run_random(b"\x00\x00\x00\x00", min_length=0, max_length=64,
                  name="tag1_data")
 
 
@@ -404,6 +404,38 @@ GRP_IECVAR_ID = 0x09
 GRP_APP_ID = 0x02
 GRP_DEVICE_ID = 0x01
 
+def body_from_tags(tree):
+    """A body rebuilt from the tag structure a previous run saw accepted.
+
+    The generic body sends two tags drawn from a wide candidate list, which for
+    a handler that wants specific ids is mostly rejected at the first unknown
+    tag.  Given the structure a reply actually came back for, the same pair can
+    be probed with a body the parser will walk into — which is the whole point of
+    recording it.
+
+    ``tree`` is ``[{"id": wire_id, "children": [...]}, ...]`` with container ids
+    carrying bit 7, so a container is rebuilt as a container rather than as a
+    leaf that merely looks like its id.
+    """
+    def emit(nodes):
+        for node in nodes:
+            tid = node["id"]
+            if node.get("children"):
+                # s_container writes the id itself, so pass the masked id back
+                s_container(tid & 0x7F, _child_builder(node["children"]))
+            else:
+                _s_value_tag(tid, "seeded_%02x" % tid, bytes(4), max_length=8)
+
+    def _child_builder(children):
+        def body():
+            emit(children)
+        return body
+
+    def body():
+        emit(tree)
+    return body
+
+
 def body_raw():
     """Unstructured bytes — the most black-box body there is.
 
@@ -417,7 +449,7 @@ def body_raw():
     layer and the garbage is what the tag parser has to deal with.
     """
     with s_block("raw"):
-        s_random(b"\x00" * 8, min_length=0, max_length=512, name="raw_data")
+        s_run_random(b"\x00" * 8, min_length=0, max_length=512, name="raw_data")
 
 
 REQUESTS = {
@@ -443,7 +475,13 @@ REQUESTS = {
     "appbp_0x16": (0x12, 0x0016, body_appbp_0x16),
     "appbp_0x19": (0x12, 0x0019, body_appbp_0x19),
     "appbp_0x39": (0x12, 0x0039, body_appbp_39),
-    "appforce_0x81_11": (0x13, 0x0001, body_appforce_81_11),
+    # CmpAppForce's real ids, from the switch in sub_EC5900: 0x20, 0x21, 0x41.
+    # An earlier version used 0x0001 as a placeholder and the runtime answered
+    # with the group's `default: return 24` — the check that caught it was
+    # --dry-run --send, which is worth running for any newly derived id.
+    "appforce_0x20": (0x13, 0x0020, body_appforce_81_11),
+    "appforce_0x21": (0x13, 0x0021, body_appforce_81_11),
+    "appforce_0x41": (0x13, 0x0041, body_appforce_81_11),
 
     # --- CmpApp / CmpDevice ---
     "app_lookup": (GRP_APP_ID, 0x0001, body_app_lookup),
@@ -497,7 +535,8 @@ MODEL_DIMENSIONS = {
 }
 
 
-def build_request(name, state, group=None, service=None, raw_body=False):
+def build_request(name, state, group=None, service=None, raw_body=False,
+                  seed_tags=None):
     """Define request ``name`` on the current boofuzz request stack.
 
     ``group``/``service`` override the model's own ids, which is what gives the
@@ -538,6 +577,10 @@ def build_request(name, state, group=None, service=None, raw_body=False):
             "pass --group/--service (use 'sweep' to fuzz a dimension)" % name)
     if raw_body:
         builder = body_raw
+    elif seed_tags:
+        # only for the generic model: a modelled request has its own real shape
+        # and replacing it with a seeded one would throw that away
+        builder = body_from_tags(seed_tags)
 
     return request_skeleton(name, state, group, service, builder)
 
