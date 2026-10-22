@@ -303,7 +303,8 @@ def test_run_state(tmp):
     print("\n[10] run state records progress")
     from runstate import RunState
     path = os.path.join(tmp, "run.state.json")
-    st = RunState(path=path, request="trace_list", seed=4242, index_end=500)
+    st = RunState(path=path, request="trace_list", seed=4242, index_end=500,
+                  depth1_cases=620)
     check_true("nothing written before save", not os.path.exists(path))
     st.last_case, st.cases_run = 87, 87
     st.save()
@@ -312,6 +313,7 @@ def test_run_state(tmp):
     back = RunState.load(path)
     check("request round-trips", back.request, "trace_list")
     check("seed round-trips", back.seed, 4242)
+    check("depth-1 case count round-trips", back.depth1_cases, 620)
     check("resume index is the next case", back.resume_index(), 88)
 
     print("\n[11] resuming with a different model is refused")
@@ -415,6 +417,50 @@ def test_crash_report(tmp):
     check_true("no dir -> nothing written", mon2._write_crash_files() is None)
 
 
+def test_block_recorder(tmp):
+    print("\n[17] a requested block is recorded per test case")
+    from boofuzz.fuzzable import Mutation
+    from boofuzz.mutation_context import MutationContext
+    from fuzzer import BlockRecorder
+
+    req = build_request("trace_configure", state())
+    path = os.path.join(tmp, "blocks.jsonl")
+    rec = BlockRecorder(req, "trace_configure", ["body", "t13"], path, seed=7)
+    name = "trace_configure.frames.services.body.t13.t13_data"
+    ctx = MutationContext(mutations={
+        name: Mutation(value=b"\xaa" * 8, qualified_name=name, index=0)})
+    rec.record(ctx, 101)
+
+    with open(path, encoding="utf-8") as fh:
+        row = json.loads(fh.readline())
+    check("case index recorded", row["case"], 101)
+    check("seed recorded", row["seed"], 7)
+    check("the mutated element is named", row["mutations"], [name])
+    body = "trace_configure.frames.services.body"
+    check("both requested blocks recorded", sorted(row["blocks"]),
+          [body, body + ".t13"])
+    t13 = row["blocks"][body + ".t13"]
+    # The named block is the *value* block; tag id and LEB128 length are
+    # siblings in `body`, so recording `body` is how you get a whole tag.
+    check("t13 is its value block, not id+length+value", t13["length"], 8)
+    check("t13 carries the mutated bytes", t13["hex"], "aa" * 8)
+
+    print("\n[18] an unknown block name is refused, not guessed")
+    try:
+        BlockRecorder(req, "trace_configure", ["no_such_block"], path)
+        ok, detail = False, "no exception"
+    except KeyError as e:
+        ok, detail = "no_such_block" in str(e), str(e)
+    check_true("unknown name is an error", ok, detail)
+
+    try:
+        BlockRecorder(req, "trace_configure", ["trace_configure"], path)
+        ok, detail = False, "no exception"
+    except KeyError as e:
+        ok, detail = "request itself" in str(e), str(e)
+    check_true("recording the request itself is refused", ok, detail)
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="surface_test_")
     print("=" * 70)
@@ -432,6 +478,7 @@ def main():
         test_legacy_rows(tmp)
         test_run_state(tmp)
         test_seeded_body()
+        test_block_recorder(tmp)
         test_crash_report(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

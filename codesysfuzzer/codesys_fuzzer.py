@@ -57,6 +57,8 @@ def dry_run(fz, send=False):
     """Render the unmutated request, handshake first so live fields are real."""
     conn = fz.connection
     print("========== dry run: %s ==========" % fz.request_name)
+    print("  depth 1  : %d single-field case(s)"
+          % fz.request.get_num_mutations())
     print("  connecting and handshaking...")
     try:
         conn.open()
@@ -235,6 +237,16 @@ def main():
                          "Off by default: over a long run that is a copy of the "
                          "whole corpus.  The request that triggers a crash is "
                          "written out in full regardless, by the crash report")
+    ap.add_argument("--record-block", metavar="NAME", action="append",
+                    help="record the rendered bytes of this block/element for "
+                         "every transmitted request, one JSON line per case.  "
+                         "Repeatable.  NAME is a qualified name or a unique "
+                         "trailing component, e.g. body, t13 or t13_data.  Off "
+                         "by default")
+    ap.add_argument("--record-file", metavar="FILE", default=None,
+                    help="file for --record-block (default "
+                         "<log-dir>/<request>_blocks_<stamp>.jsonl).  Appended "
+                         "to, one JSON object per test case")
     ap.add_argument("--seed", type=lambda s: int(s, 0), default=None,
                     help="pin the run's random seed.  Payloads are drawn from a "
                          "per-run seed rather than a fixed one, so two runs of a "
@@ -307,6 +319,8 @@ graded black-box modes — how much you tell it about the target:
 
     if not args.target:
         ap.error("a target address is required (or use --list-requests)")
+    if args.record_file and not args.record_block:
+        ap.error("--record-file has nothing to record without --record-block")
     # --resume can supply the request, so it must not be required up front
     if not args.request and not args.all and not args.all_groups             and not args.from_pairs and not args.resume:
         ap.error("--request is required (or --all / --all-groups / --from-pairs "
@@ -681,6 +695,10 @@ def run_all(args):
 
 def run_one(args, request_name, stamp):
     """One model, one session, one database.  Returns a process exit code."""
+    record_path = None
+    if args.record_block:
+        record_path = args.record_file or os.path.join(
+            args.log_dir, "%s_blocks_%s.jsonl" % (request_name, stamp))
     fz = Fuzzer(target_ip=args.target, target_port=args.port,
                 request_name=request_name, user=args.user,
                 password=args.password, app_name=args.app_name,
@@ -695,11 +713,22 @@ def run_one(args, request_name, stamp):
                 seed_tags=getattr(args, "seed_tags", None),
                 crash_dir=args.log_dir, seed=run_seed(),
                 log_payloads=args.log_payloads,
+                record_blocks=args.record_block, record_path=record_path,
                 surface_path=_surface_path(args, request_name, stamp))
 
     # build the connection, monitor and request model (no network yet)
     fz._init_target_connection()
-    fz._init_protocol_structure()
+    try:
+        fz._init_protocol_structure()
+    except (KeyError, ValueError) as e:
+        # a bad --record-block name is a command-line mistake, not a crash
+        print("[!] %s" % e)
+        return 2
+
+    # boofuzz's depth-1 mutations: one field changed per case, every other
+    # field at its model default.  The run continues into multi-field
+    # combinations after this, so this is the finite count worth recording.
+    depth1_cases = fz.request.get_num_mutations()
 
     if args.dry_run:
         return dry_run(fz, send=args.send)
@@ -725,6 +754,7 @@ def run_one(args, request_name, stamp):
         index_start = nxt
         state.path = state_path
         state.index_end = index_end
+        state.depth1_cases = depth1_cases
         state.db_file = db_path
         print("[resume] continuing at case %d" % index_start)
     else:
@@ -754,7 +784,7 @@ def run_one(args, request_name, stamp):
                          group=args.group, service=args.service,
                          raw_body=bool(args.raw_body), seed=run_seed(),
                          index_start=index_start, index_end=index_end,
-                         db_file=db_path)
+                         depth1_cases=depth1_cases, db_file=db_path)
     state.save()
 
     fz._init_session(db_filename=db_path, index_start=index_start,
@@ -780,10 +810,14 @@ def run_one(args, request_name, stamp):
                                       ", raw body" if args.raw_body else ""))
     print("  cases    : %s" % ("%d..%s" % (index_start, index_end)
                                if index_end else "all"))
+    print("  depth 1  : %d single-field case(s)" % depth1_cases)
     print("  probe    : %s" % ("off" if args.no_probe
                                else "every %d case(s)" % args.probe_every))
     print("  cases    : %s..%s" % (index_start, index_end or "all"))
     print("  seed     : %d" % run_seed())
+    if record_path:
+        print("  record   : %s (%s)"
+              % (record_path, ", ".join(args.record_block)))
     print("  state    : %s" % state_path)
     print("  db       : %s" % db_path)
     if not args.no_web:

@@ -158,6 +158,43 @@ zlib+pickle blob which sets `_index_start` to whatever it finds, and pointing it
 at the wrong path silently turns a run into "0 cases, no error" — see
 *Findings* below.
 
+### Per-run depth-1 case count
+
+Every run prints, and records in the state file, how many single-field test
+cases boofuzz has for the request it is about to build:
+
+```
+  depth 1  : 620 single-field case(s)
+```
+
+The same number is written to the run state as `depth1_cases`. Indices
+`1..N` are the depth-1 cases (one field mutated, everything else at its
+default); boofuzz then continues into multi-field combinations, whose count is
+far too large to enumerate. The count is request-shape dependent, so it changes
+with `--group`/`--service`/`--raw-body` just as the body does.
+
+### Recording a block per case
+
+`--record-block NAME` writes the rendered bytes of a chosen block for each
+request actually handed to the socket, one JSON object per line (appended):
+
+```
+python codesysfuzzer/codesys_fuzzer.py <target> -r trace_configure \
+    --record-block body --record-file logs/trace_body.jsonl
+```
+
+`NAME` may be the full qualified name or a unique trailing component (`body`,
+`t13`, `t13_data`); repeat the flag to record several. The default file is
+`<log-dir>/<request>_blocks_<stamp>.jsonl`.
+
+Recording hooks `Request.render`, not the pre-send callback: the callback runs
+before rendering, so it cannot see mutated bytes. A block is re-rendered from
+the same mutation context, which is safe here because the renderers are pure
+(`FrameEncoder` advances no counters). Note that a model's named block is its
+*value* block: `t13` records the tag's content only — to see the whole tag
+stream including ids and lengths, record `body`. Each line carries the case
+index, seed, the mutated element names, and `{length, hex}` per block.
+
 ### Body seeds: what the runtime actually accepted
 
 A pair file that says "0x12/0x39 answered" is a lead; one that says "0x12/0x39

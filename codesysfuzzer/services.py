@@ -65,6 +65,27 @@ def _s_value_tag(tag_id, block_name, default, max_length=None):
                  max_length=max_length if max_length is not None else len(default),
                  name=block_name + "_data")
 
+def _s_value_tag_random(block_name, default, max_length=None):
+    """A tag whose *content* is fuzzed at a fixed length."""
+    with s_block(block_name):
+        s_static(bytes([0x86, 0x01]))
+        # s_run_random(b"\x86", min_length=1, max_length=1, name=block_name+"_tag")
+        s_leb_size(block_name)
+        s_run_random(default, min_length=len(default),
+                         max_length=max_length if max_length is not None else len(default),
+                         name=block_name + "_data")
+
+def _s_body_container_tag_random():
+    block_name = "tagrandom"
+    default = b"App.Trace\x00\x00\x00"
+    max_length = 12
+    with s_block(block_name):
+        # s_static(bytes([0x30]))
+        s_run_random(b"\x30", min_length=1, max_length=1, name=block_name+"_tag")
+        s_leb_size(block_name)
+        s_run_random(default, min_length=len(default),
+                         max_length=max_length if max_length is not None else len(default),
+                         name=block_name + "_data")
 
 def _s_grow_tag(tag_id, block_name, default, sweep=None):
     """A tag whose content is fuzzed *and* grown — a memcpy-destination candidate.
@@ -108,6 +129,13 @@ def body_trace_configure():
 
     s_container(0x86, _body_container_86)
 
+def body_trace_configure_random_tag():
+    #s_container(0x86, _s_body_container_tag_random)
+    _s_value_tag_random("tagrandom", b"\x00", max_length=12)
+    
+    # for i in range(256):
+    #     _s_value_tag(i, "s"+str(i), b"\x00\x00\x00\x00", max_length=8)
+    #     _s_grow_tag(i, "g"+str(i), b"\x00\x00\x00\x00")
 
 def _body_container_86():
     """Container 0x86 — the short path to EIP (tags 0x30 and 0x33)."""
@@ -455,6 +483,7 @@ def body_raw():
 REQUESTS = {
     # --- CmpTraceMgr: the known-vulnerable surface ---
     "trace_configure": (GRP_TRACE_ID, 0x0002, body_trace_configure),
+    "trace_configure2": (GRP_TRACE_ID, 0x0002, body_trace_configure_random_tag),
     "trace_configure_flat": (GRP_TRACE_ID, 0x0002, body_trace_configure_flat),
     "trace_configure_liar": (GRP_TRACE_ID, 0x0002, body_trace_configure_liar),
     "trace_list": (GRP_TRACE_ID, 0x0001, body_trace_list),

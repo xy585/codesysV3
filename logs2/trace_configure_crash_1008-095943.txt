@@ -1,0 +1,79 @@
+CODESYS V3 fuzzer - crash report
+====================================================================
+  when        : 2026-10-08 09:59:43
+  target      : 192.168.125.129
+  request     : trace_configure
+  case        : 300   (boofuzz total_mutant_index)
+  cases run   : 2
+  detector    : TimeoutError: timed out
+  request size: 732 bytes as sent
+  seed        : 243565400
+  database    : logs\trace_configure_1008-095937.db
+
+Reproduce
+--------------------------------------------------------------------
+  python codesysfuzzer/codesys_fuzzer.py 192.168.125.129 -r trace_configure --case 300 --seed 243565400 --surface off
+
+  The seed is required: the random parts of a request come from the
+  run's seed, so the same case index with a different seed sends
+  different bytes.  --surface off keeps the replay out of the pair
+  file.  Do not use --resume for this: it continues at the next case
+  and skips this one.
+
+Structured request (group / service / tags)
+--------------------------------------------------------------------
+  group 0x000f  service 0x0002
+  body did not parse: tag 0x06 claims 544 bytes, only 376 left
+  body hex: 108c80004170702e547261636500000016848000000000001184800041707000128880005461736b000000001384800001000000148480006500000015848000100000008601a00430c48300a4a4b2c15bfb3919cc454d0e4684340264bcecf41b63a36a7d3f763c655353b082774d73c13a9d763d06e781b719fcabb643bee7046ff4b31964216d6addbd0b5fa11df08eb6163e48fa05d4ed803059c532b1c5715ce624818ee4709a7650e7b92d8e32839acb132b01c4b357fc779ae5e0a9306ddeab6b04259bd9503420e7d96906f0beb2b99b792926fb4768b43bb195140fc7c0eb38630740adf552d579200e0a9d4b5ab5bc0dd966fe19e3913f0d3668063862a860083e6875aa611ea1f8d67074ff358da5e68d69331eb2f10a0326007777921560d1bb8bbfbb6f914e402237deef56b40e5bdc128b6b3baa0f7dd5e8293116c36d5f69260ecdae04f5a4461f1ee80bf9fcc0ab17fa962a25fab5b3b8b1eb67d022129e4eaf87401aa24409b52f2cd37639287dd6f7581a0bb6ce47c5d0531471b75690c25d3678261b15fd44670005e9ad9df5ade5a890329afb851829e127356aeb0516b69d08e1415041c42d8bdc84f610aac3ea93b61e5326a4f1a4
+
+Raw bytes (block driver + datagram + channel frames + services)
+--------------------------------------------------------------------
+  note: the sqlite database truncates this at 512 bytes; this file
+        does not, so it is the copy to keep
+
+  0000  00 01 17 e8 08 02 00 00 c5 73 40 40 00 33 2d dc  .........s@@.3-.
+  0010  c0 a8 7d 81 e0 e4 c0 a8 7d 81 00 00 01 81 84 23  ..}.....}......#
+  0020  89 3a 7b f0 07 00 00 00 05 00 00 00 7c 02 00 00  .:{.........|...
+  0030  17 65 d6 80 55 cd 10 00 0f 00 02 00 0b cc 4a a2  .e..U.........J.
+  0040  68 02 00 00 00 00 00 00 10 8c 80 00 41 70 70 2e  h...........App.
+  0050  54 72 61 63 65 00 00 00 16 84 80 00 00 00 00 00  Trace...........
+  0060  11 84 80 00 41 70 70 00 12 88 80 00 54 61 73 6b  ....App.....Task
+  0070  00 00 00 00 13 84 80 00 01 00 00 00 14 84 80 00  ................
+  0080  65 00 00 00 15 84 80 00 10 00 00 00 86 01 a0 04  e...............
+  0090  30 c4 83 00 a4 a4 b2 c1 5b fb 39 19 cc 45 4d 0e  0.......[.9..EM.
+  00a0  46 84 34 02 64 bc ec f4 1b 63 a3 6a 7d 3f 76 3c  F.4.d....c.j}?v<
+  00b0  65 53 53 b0 82 77 4d 73 c1 3a 9d 76 3d 06 e7 81  eSS..wMs.:.v=...
+  00c0  b7 19 fc ab b6 43 be e7 04 6f f4 b3 19 64 21 6d  .....C...o...d!m
+  00d0  6a dd bd 0b 5f a1 1d f0 8e b6 16 3e 48 fa 05 d4  j..._......>H...
+  00e0  ed 80 30 59 c5 32 b1 c5 71 5c e6 24 81 8e e4 70  ..0Y.2..q\.$...p
+  00f0  9a 76 50 e7 b9 2d 8e 32 83 9a cb 13 2b 01 c4 b3  .vP..-.2....+...
+  0100  57 fc 77 9a e5 e0 a9 30 6d de ab 6b 04 25 9b d9  W.w....0m..k.%..
+  0110  50 34 20 e7 d9 69 06 f0 be b2 b9 9b 79 29 26 fb  P4 ..i......y)&.
+  0120  47 68 b4 3b b1 95 14 0f c7 c0 eb 38 63 07 40 ad  Gh.;.......8c.@.
+  0130  f5 52 d5 79 20 0e 0a 9d 4b 5a b5 bc 0d d9 66 fe  .R.y ...KZ....f.
+  0140  19 e3 91 3f 0d 36 68 06 38 62 a8 60 08 3e 68 75  ...?.6h.8b.`.>hu
+  0150  aa 61 1e a1 f8 d6 70 74 ff 35 8d a5 e6 8d 69 33  .a....pt.5....i3
+  0160  1e b2 f1 0a 03 26 00 77 77 92 15 60 d1 bb 8b bf  .....&.ww..`....
+  0170  bb 6f 91 4e 40 22 37 de ef 56 b4 0e 5b dc 12 8b  .o.N@"7..V..[...
+  0180  6b 3b aa 0f 7d d5 e8 29 31 16 c3 6d 5f 69 26 0e  k;..}..)1..m_i&.
+  0190  cd ae 04 f5 a4 46 1f 1e e8 0b f9 fc c0 ab 17 fa  .....F..........
+  01a0  96 2a 25 fa b5 b3 b8 b1 eb 67 d0 22 12 9e 4e af  .*%......g."..N.
+  01b0  87 40 1a a2 44 09 b5 2f 2c d3 76 39 28 7d d6 f7  .@..D../,.v9(}..
+  01c0  58 1a 0b b6 ce 47 c5 d0 53 14 71 b7 56 90 c2 5d  X....G..S.q.V..]
+  01d0  36 78 26 1b 15 fd 44 67 00 05 e9 ad 9d f5 ad e5  6x&...Dg........
+  01e0  a8 90 32 9a fb 85 18 29 e1 27 35 6a eb 05 16 b6  ..2....).'5j....
+  01f0  9d 08 e1 41 50 41 c4 2d 8b dc 84 f6 10 aa c3 ea  ...APA.-........
+  0200  93 b6 1e 53 26 a4 f1 a4 00 01 17 e8 d4 00 00 00  ...S&...........
+  0210  c5 73 40 40 00 33 2d dc c0 a8 7d 81 e0 e4 c0 a8  .s@@.3-...}.....
+  0220  7d 81 00 00 01 80 84 23 89 3a 7b f0 08 00 00 00  }......#.:{.....
+  0230  05 00 00 00 cd d1 19 70 62 bc a9 da 61 e1 89 70  .......pb...a..p
+  0240  40 e1 88 41 f0 22 8c 04 a2 d6 20 6d 8a 3d 5a 03  @..A.".... m.=Z.
+  0250  af 1c 08 f7 d7 01 1c 42 06 6b 19 97 1c 88 7a d4  .......B.k....z.
+  0260  da 71 6c e1 21 c1 ac 41 ee 50 20 75 20 77 dd 3f  .ql.!..A.P u w.?
+  0270  c6 f0 ec 92 18 77 fa 94 b1 47 67 26 d3 62 02 8d  .....w...Gg&.b..
+  0280  84 a4 68 c4 31 84 80 00 01 00 00 00 34 84 80 00  ..h.1.......4...
+  0290  33 00 00 00 33 84 80 00 05 00 00 00 83 01 bc 00  3...3...........
+  02a0  21 84 80 00 01 02 00 00 4e 84 80 00 05 00 00 00  !.......N.......
+  02b0  4d 88 80 00 02 9e 3b 06 00 00 00 00 20 8c 80 00  M.....;..... ...
+  02c0  50 4f 55 2e 69 54 65 73 74 00 00 00 25 84 80 00  POU.iTest...%...
+  02d0  07 00 00 00 26 84 80 00 02 00 00 00              ....&.......

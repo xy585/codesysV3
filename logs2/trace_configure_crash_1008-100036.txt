@@ -1,0 +1,110 @@
+CODESYS V3 fuzzer - crash report
+====================================================================
+  when        : 2026-10-08 10:00:36
+  target      : 192.168.125.129
+  request     : trace_configure
+  case        : 307   (boofuzz total_mutant_index)
+  cases run   : 7
+  detector    : TimeoutError: timed out
+  request size: 1224 bytes as sent
+  seed        : 243565400
+  database    : logs\trace_configure_1008-100018.db
+
+Reproduce
+--------------------------------------------------------------------
+  python codesysfuzzer/codesys_fuzzer.py 192.168.125.129 -r trace_configure --case 307 --seed 243565400 --surface off
+
+  The seed is required: the random parts of a request come from the
+  run's seed, so the same case index with a different seed sends
+  different bytes.  --surface off keeps the replay out of the pair
+  file.  Do not use --resume for this: it continues at the next case
+  and skips this one.
+
+Structured request (group / service / tags)
+--------------------------------------------------------------------
+  group 0x000f  service 0x0002
+  body did not parse: tag 0x06 claims 992 bytes, only 376 left
+  body hex: 108c80004170702e547261636500000016848000000000001184800041707000128880005461736b000000001384800001000000148480006500000015848000100000008601e00730848700c7221e0cda667b733c533a75ed7abe70fb3405162870e1fcd0af92ba92e6610630a7b88db8034ab7964cb4ad18236c62be4c99571bbb76c0a4d99f0398ae15e35b6de3b42b7d3b5a793b64bc3327c15446bac0e755978902f624e7012c86307fbce01e8d3e34de49280bc7e15002924fcb9c669d60553f9676f569e8ba1fcab8cf606948b1dcf680450fb36b8de981260d75fa38c996d7d3161bbc60e9acb33fdd88753de2ef74fc5001cfdc4029ccc2d36a3a3695b4f09252f9ca87ca08f34c8431345afe932fe0d1ee5a82e5c0b0eafb6893d8dbbd1ba37df5c454230f671bddc941bf67281ba354a31ba45d87b9bd745eabed4c07df89803cdc800df5496f7cbc9bbe5b30cd83e35fc6ed2311b8be6697194411cf90a3a19f43b9d77eb46227b7047a36d7fa6fb6d26274ba0e51385f37eaeaac8635c9b3f5283262c9fb49bf988acb9cb75aba4b7013e9d1bc1775b5f47fd029a662c42266a1b348f50a019df2aaeb0d6947ef42c9be13b3e7ed615fec393b
+
+Raw bytes (block driver + datagram + channel frames + services)
+--------------------------------------------------------------------
+  note: the sqlite database truncates this at 512 bytes; this file
+        does not, so it is the copy to keep
+
+  0000  00 01 17 e8 08 02 00 00 c5 73 40 40 00 33 2d dc  .........s@@.3-.
+  0010  c0 a8 7d 81 e0 f4 c0 a8 7d 81 00 00 01 81 c8 0e  ..}.....}.......
+  0020  7c 46 8c b5 13 00 00 00 05 00 00 00 3c 04 00 00  |F..........<...
+  0030  98 17 8b 88 55 cd 10 00 0f 00 02 00 c7 56 5a b5  ....U........VZ.
+  0040  28 04 00 00 00 00 00 00 10 8c 80 00 41 70 70 2e  (...........App.
+  0050  54 72 61 63 65 00 00 00 16 84 80 00 00 00 00 00  Trace...........
+  0060  11 84 80 00 41 70 70 00 12 88 80 00 54 61 73 6b  ....App.....Task
+  0070  00 00 00 00 13 84 80 00 01 00 00 00 14 84 80 00  ................
+  0080  65 00 00 00 15 84 80 00 10 00 00 00 86 01 e0 07  e...............
+  0090  30 84 87 00 c7 22 1e 0c da 66 7b 73 3c 53 3a 75  0...."...f{s<S:u
+  00a0  ed 7a be 70 fb 34 05 16 28 70 e1 fc d0 af 92 ba  .z.p.4..(p......
+  00b0  92 e6 61 06 30 a7 b8 8d b8 03 4a b7 96 4c b4 ad  ..a.0.....J..L..
+  00c0  18 23 6c 62 be 4c 99 57 1b bb 76 c0 a4 d9 9f 03  .#lb.L.W..v.....
+  00d0  98 ae 15 e3 5b 6d e3 b4 2b 7d 3b 5a 79 3b 64 bc  ....[m..+};Zy;d.
+  00e0  33 27 c1 54 46 ba c0 e7 55 97 89 02 f6 24 e7 01  3'.TF...U....$..
+  00f0  2c 86 30 7f bc e0 1e 8d 3e 34 de 49 28 0b c7 e1  ,.0.....>4.I(...
+  0100  50 02 92 4f cb 9c 66 9d 60 55 3f 96 76 f5 69 e8  P..O..f.`U?.v.i.
+  0110  ba 1f ca b8 cf 60 69 48 b1 dc f6 80 45 0f b3 6b  .....`iH....E..k
+  0120  8d e9 81 26 0d 75 fa 38 c9 96 d7 d3 16 1b bc 60  ...&.u.8.......`
+  0130  e9 ac b3 3f dd 88 75 3d e2 ef 74 fc 50 01 cf dc  ...?..u=..t.P...
+  0140  40 29 cc c2 d3 6a 3a 36 95 b4 f0 92 52 f9 ca 87  @)...j:6....R...
+  0150  ca 08 f3 4c 84 31 34 5a fe 93 2f e0 d1 ee 5a 82  ...L.14Z../...Z.
+  0160  e5 c0 b0 ea fb 68 93 d8 db bd 1b a3 7d f5 c4 54  .....h......}..T
+  0170  23 0f 67 1b dd c9 41 bf 67 28 1b a3 54 a3 1b a4  #.g...A.g(..T...
+  0180  5d 87 b9 bd 74 5e ab ed 4c 07 df 89 80 3c dc 80  ]...t^..L....<..
+  0190  0d f5 49 6f 7c bc 9b be 5b 30 cd 83 e3 5f c6 ed  ..Io|...[0..._..
+  01a0  23 11 b8 be 66 97 19 44 11 cf 90 a3 a1 9f 43 b9  #...f..D......C.
+  01b0  d7 7e b4 62 27 b7 04 7a 36 d7 fa 6f b6 d2 62 74  .~.b'..z6..o..bt
+  01c0  ba 0e 51 38 5f 37 ea ea ac 86 35 c9 b3 f5 28 32  ..Q8_7....5...(2
+  01d0  62 c9 fb 49 bf 98 8a cb 9c b7 5a ba 4b 70 13 e9  b..I......Z.Kp..
+  01e0  d1 bc 17 75 b5 f4 7f d0 29 a6 62 c4 22 66 a1 b3  ...u....).b."f..
+  01f0  48 f5 0a 01 9d f2 aa eb 0d 69 47 ef 42 c9 be 13  H........iG.B...
+  0200  b3 e7 ed 61 5f ec 39 3b 00 01 17 e8 08 02 00 00  ...a_.9;........
+  0210  c5 73 40 40 00 33 2d dc c0 a8 7d 81 e0 f4 c0 a8  .s@@.3-...}.....
+  0220  7d 81 00 00 01 80 c8 0e 7c 46 8c b5 14 00 00 00  }.......|F......
+  0230  05 00 00 00 f0 9e e6 aa bb 1e 66 6d 12 35 ad 6d  ..........fm.5.m
+  0240  92 cd d7 0d f6 27 d1 b3 9e e9 20 5c 80 40 80 c8  .....'.... \.@..
+  0250  7f 3f 6b 6d 97 48 22 3b 51 20 60 c0 1e e7 28 0a  .?km.H";Q `...(.
+  0260  5b 2c d6 05 a3 35 3f 73 2f 78 3e fb 2b de ae 71  [,...5?s/x>.+..q
+  0270  89 05 2c 66 8f 03 da 15 80 b3 e9 4c 72 19 69 df  ..,f.......Lr.i.
+  0280  c3 15 a9 b2 70 1f ba a3 9f de 8f ba 9c 16 4a d3  ....p.........J.
+  0290  ac ec af 1e aa 33 c3 1d 70 65 c9 47 c0 84 45 3b  .....3..pe.G..E;
+  02a0  f3 67 c7 91 a1 a8 a6 0a 84 84 7f df 90 a7 d9 15  .g..............
+  02b0  2d fb 38 0c b5 bd e8 66 8d d2 11 8d 01 f8 fe fd  -.8....f........
+  02c0  54 bc c1 b6 a6 4e 8a b4 18 42 01 8d 3c 81 0f 29  T....N...B..<..)
+  02d0  bb a1 e0 4c 27 57 7c 01 35 08 01 9f 37 1a ab 29  ...L'W|.5...7..)
+  02e0  ed 3d bb 35 58 b9 16 49 b9 24 03 86 fa 8b c3 3c  .=.5X..I.$.....<
+  02f0  0a c3 c8 37 16 10 8a 8c 96 ee 4d f0 97 af f9 06  ...7......M.....
+  0300  fc 73 83 71 88 1e 96 8d f9 14 20 95 5c c7 a4 16  .s.q...... .\...
+  0310  d2 e5 a9 11 10 be 88 1b 8c fa e4 5a 91 b2 0a f2  ...........Z....
+  0320  1d 3a ca 29 e4 00 db da a9 21 aa 1e 97 6d 51 fe  .:.).....!...mQ.
+  0330  77 b9 5e a6 28 4c 63 73 2e 44 e6 50 70 38 be 99  w.^.(Lcs.D.Pp8..
+  0340  f8 a5 13 df 3d e0 b8 66 27 5b 27 fa 6e 8e 68 80  ....=..f'['.n.h.
+  0350  80 6b df 08 b1 2a 77 ef 79 20 8c 71 3c eb a3 fc  .k...*w.y .q<...
+  0360  64 56 ed da 81 b8 d2 b9 7c 99 33 ef b1 0c 95 54  dV......|.3....T
+  0370  00 68 1e 8d ca 29 57 cd 4b ba 67 0c ad 8e 8e 17  .h...)W.K.g.....
+  0380  46 90 13 cc a9 4c dd db 49 8f d7 76 8b c8 7a d3  F....L..I..v..z.
+  0390  12 b1 d5 d0 1e b7 e7 e4 47 2d 38 ab cc 07 e2 fb  ........G-8.....
+  03a0  62 98 35 c8 95 73 70 79 c9 65 d6 ae 91 3a e7 c5  b.5..spy.e...:..
+  03b0  75 a4 3c 02 d8 80 59 bb 2c 61 77 10 20 8e 4e 65  u.<...Y.,aw. .Ne
+  03c0  3a 32 2b 1d f1 54 2b 9e 5f 59 22 ca 8c 35 7e a5  :2+..T+._Y"..5~.
+  03d0  74 15 f9 7c fd e6 b5 21 48 91 4b f3 35 90 8b 9e  t..|...!H.K.5...
+  03e0  da 16 7e 85 c8 b8 83 8c 2f d1 42 8a 1f 45 be a9  ..~...../.B..E..
+  03f0  dc 82 d4 31 32 9f 37 de 12 d6 f5 d2 ee 21 c3 48  ...12.7......!.H
+  0400  c2 78 62 02 0a 6e a9 1a 60 9a 6f 14 ea 58 1f f4  .xb..n..`.o..X..
+  0410  00 01 17 e8 b8 00 00 00 c5 73 40 40 00 33 2d dc  .........s@@.3-.
+  0420  c0 a8 7d 81 e0 f4 c0 a8 7d 81 00 00 01 80 c8 0e  ..}.....}.......
+  0430  7c 46 8c b5 15 00 00 00 05 00 00 00 27 5c 63 f9  |F..........'\c.
+  0440  4d 03 ef bc c6 cd 53 6b d1 e6 b4 9f d3 4d 4b 35  M.....Sk.....MK5
+  0450  e1 f5 17 e3 6f 0a 3d 2a f1 91 b3 d3 5d 3f f0 8b  ....o.=*....]?..
+  0460  bf f7 ec 39 01 aa ff 57 31 e6 f6 4e fb c8 39 b8  ...9...W1..N..9.
+  0470  31 84 80 00 01 00 00 00 34 84 80 00 33 00 00 00  1.......4...3...
+  0480  33 84 80 00 05 00 00 00 83 01 bc 00 21 84 80 00  3...........!...
+  0490  01 02 00 00 4e 84 80 00 05 00 00 00 4d 88 80 00  ....N.......M...
+  04a0  02 9e 3b 06 00 00 00 00 20 8c 80 00 50 4f 55 2e  ..;..... ...POU.
+  04b0  69 54 65 73 74 00 00 00 25 84 80 00 07 00 00 00  iTest...%.......
+  04c0  26 84 80 00 02 00 00 00                          &.......

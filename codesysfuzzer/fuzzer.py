@@ -20,6 +20,8 @@ the frame (channel id, token, block counters, sizes, CRC32) is filled in at
 render time by ``FrameEncoder``.
 """
 
+import json
+import os
 import struct
 
 from boofuzz import FuzzLoggerText, Session, Target
@@ -58,6 +60,80 @@ class NoPayloadLogger(FuzzLoggerText):
         self._print_log_msg(msg=self._summary(data), msg_type="info")
 
 
+class BlockRecorder(object):
+    """Write selected blocks of the requests boofuzz actually renders.
+
+    Hooked onto ``Request.render`` rather than the pre-send callback, because
+    that callback runs *before* rendering: it can inject live values but cannot
+    see the mutated bytes.  ``Session.transmit_fuzz`` renders the request and
+    hands exactly that byte string to ``Target.send``, so the top-level render
+    is the last point where "what was sent" (before framing is undone by the
+    connection) is observable.
+
+    A block is re-rendered from the same ``MutationContext``.  Every renderer
+    here is pure -- ``FrameEncoder`` deliberately advances no counters, and
+    mutations are already materialised values -- so the re-render is the exact
+    byte string that was framed and sent, not a second, different draw.
+    """
+
+    def __init__(self, request, request_name, block_names, path, seed=None):
+        self.request = request
+        self.request_name = request_name
+        self.path = path
+        self.seed = seed
+        self.targets = [self._resolve(wanted) for wanted in block_names]
+
+    def _resolve(self, wanted):
+        """Map a CLI name to a qualified name in ``request.names``.
+
+        Accepts either the full qualified name or a unique trailing component
+        (``body``, ``t13``, ``t13_data``).  Ambiguity is an error rather than a
+        guess: silently recording the wrong block would produce a file that
+        looks right and is useless for replay.
+        """
+        names = self.request.names
+        if wanted in names:
+            if names[wanted] is self.request:
+                raise KeyError("cannot record the request itself (%r): "
+                               "recording it would re-enter the render hook"
+                               % wanted)
+            return wanted
+        matches = [n for n, node in names.items()
+                   if node is not self.request
+                   and n.rsplit(".", 1)[-1] == wanted]
+        if len(matches) == 1:
+            return matches[0]
+        if not matches:
+            raise KeyError(
+                "no block or element named %r in request %r (have: %s)"
+                % (wanted, self.request_name,
+                   ", ".join(sorted(n.rsplit(".", 1)[-1] for n in names))))
+        raise KeyError("block name %r is ambiguous in request %r: %s"
+                       % (wanted, self.request_name,
+                          ", ".join(sorted(matches))))
+
+    def record(self, mutation_context, case_index):
+        if mutation_context is None:
+            return
+        entry = {"case": case_index,
+                 "request": self.request_name,
+                 "seed": self.seed,
+                 "mutations": sorted(mutation_context.mutations),
+                 "blocks": {}}
+        for qualified in self.targets:
+            data = self.request.names[qualified].render(
+                mutation_context=mutation_context)
+            entry["blocks"][qualified] = {"length": len(data), "hex": data.hex()}
+
+        parent = os.path.dirname(self.path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        # Append per case: a crash leaves every request up to the crash on
+        # disk, which is the point of the option.
+        with open(self.path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, separators=(",", ":")) + "\n")
+
+
 class Fuzzer(object):
 
     def __init__(self, target_ip, target_port, request_name,
@@ -67,7 +143,7 @@ class Fuzzer(object):
                  group=None, service=None, raw_body=False, surface_path=None,
                  surface_mode="global", state=None, state_every=25, seed_tags=None,
                  crash_dir=None, seed=None, db_path=None,
-                 log_payloads=False,
+                 log_payloads=False, record_blocks=None, record_path=None,
                  reply_timeout=2.0, **connection_kwargs):
         self.target_ip = target_ip
         self.target_port = target_port
@@ -91,6 +167,9 @@ class Fuzzer(object):
         self.db_path = db_path
         self.crash_dir = crash_dir
         self.log_payloads = log_payloads
+        self.record_blocks = record_blocks or []
+        self.record_path = record_path
+        self.recorder = None
         self.state = state
         self.state_every = max(1, state_every)
         self.reply_timeout = reply_timeout
@@ -199,6 +278,34 @@ class Fuzzer(object):
                                      group=self.group, service=self.service,
                                      raw_body=self.raw_body,
                                      seed_tags=self.seed_tags)
+        self._install_block_recorder()
+
+    def _install_block_recorder(self):
+        """Wrap ``Request.render`` so selected blocks are written per case.
+
+        ``self.session`` does not exist yet when the request is built (the
+        session needs the db path, which the CLI picks later), so the wrapper
+        checks for it at call time.  That also keeps ``--dry-run`` from writing
+        a line for its one unmutated render.
+        """
+        if not self.record_blocks:
+            return
+        if not self.record_path:
+            raise ValueError("--record-block needs a file to write to")
+        self.recorder = BlockRecorder(self.request, self.request_name,
+                                      self.record_blocks, self.record_path,
+                                      seed=self.seed)
+        render = self.request.render
+
+        def render_and_record(mutation_context=None):
+            data = render(mutation_context=mutation_context)
+            if self.session is not None:
+                self.recorder.record(
+                    mutation_context,
+                    getattr(self.session, "total_mutant_index", None))
+            return data
+
+        self.request.render = render_and_record
 
     def init(self):
         self._init_target_connection()

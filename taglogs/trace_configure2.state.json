@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "request": "trace_configure2",
+  "group": null,
+  "service": null,
+  "raw_body": false,
+  "seed": 2685077015,
+  "index_start": 1,
+  "index_end": null,
+  "last_case": 1630,
+  "cases_run": 1630,
+  "started": "2026-10-21T20:15:21",
+  "updated": "2026-10-21T22:19:51",
+  "db_file": "logs\\trace_configure2_1021-204139.db",
+  "surface_file": null
+}

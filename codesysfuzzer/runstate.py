@@ -25,6 +25,11 @@ What is recorded, and why each field is there
 ``index_start``/``index_end``/last_case/cases_run
     the position.  ``last_case`` is boofuzz's ``total_mutant_index``, which is
     the same numbering ``--cases`` and ``--case`` speak.
+``depth1_cases``
+    how many single-field test cases boofuzz has for this request.  The run
+    itself keeps going into multi-field combinations, so this is the one
+    finite, meaningful count the state file can carry: indices 1..N are depth
+    1, and everything past N mutates two or more fields at once.
 """
 
 import json
@@ -47,6 +52,7 @@ class RunState(object):
         self.seed = None
         self.index_start = 1
         self.index_end = None
+        self.depth1_cases = None
         self.last_case = 0
         self.cases_run = 0
         self.started = time.strftime("%Y-%m-%dT%H:%M:%S")
@@ -61,8 +67,8 @@ class RunState(object):
     def as_dict(self):
         return {k: getattr(self, k) for k in (
             "version", "request", "group", "service", "raw_body", "seed",
-            "index_start", "index_end", "last_case", "cases_run", "started",
-            "updated", "db_file", "surface_file")}
+            "index_start", "index_end", "depth1_cases", "last_case",
+            "cases_run", "started", "updated", "db_file", "surface_file")}
 
     @classmethod
     def load(cls, path):
@@ -105,10 +111,11 @@ class RunState(object):
 
     # ------------------------------------------------------------
     def describe(self):
-        return ("%s group=%s service=%s raw_body=%s seed=%s case %s/%s "
-                "(%s run)" % (self.request, self.group, self.service,
-                              self.raw_body, self.seed, self.last_case,
-                              self.index_end, self.cases_run))
+        return ("%s group=%s service=%s raw_body=%s seed=%s depth1=%s "
+                "case %s/%s (%s run)"
+                % (self.request, self.group, self.service, self.raw_body,
+                   self.seed, self.depth1_cases, self.last_case,
+                   self.index_end, self.cases_run))
 
     def conflicts_with(self, request, group, service, raw_body):
         """Whether the CLI asks for something other than what was recorded."""
