@@ -30,6 +30,14 @@ What is recorded, and why each field is there
     itself keeps going into multi-field combinations, so this is the one
     finite, meaningful count the state file can carry: indices 1..N are depth
     1, and everything past N mutates two or more fields at once.
+``mode``/``corpus_digest``/``corpus_manifest``/``mutation_mode``/
+``mutations_per_seed``/``max_body_size``/``seed_order``/``corpus_path``
+    seed-mode identity.  A data-driven case index is ``(seed, local mutation)``
+    under a fixed corpus order and a fixed per-seed budget, so resuming against
+    a different corpus, budget or seed order would send a different packet while
+    claiming to continue the same run.  The recorded values are used on resume
+    and the corpus digest is checked.  ``corpus_path`` is what lets ``--resume``
+    find the same corpus without the operator having to remember it.
 """
 
 import json
@@ -37,7 +45,7 @@ import os
 import tempfile
 import time
 
-VERSION = 1
+VERSION = 2
 
 
 class RunState(object):
@@ -49,6 +57,7 @@ class RunState(object):
         self.group = None
         self.service = None
         self.raw_body = False
+        self.mode = "model"          # "model" (grammar) or "seed" (data-driven)
         self.seed = None
         self.index_start = 1
         self.index_end = None
@@ -59,6 +68,21 @@ class RunState(object):
         self.updated = self.started
         self.db_file = None
         self.surface_file = None
+        #: seed-mode only: which corpus and mutation schedule this index means.
+        #: A case index is only reproducible against the same corpus, so a
+        #: resume with a changed corpus is refused rather than silently
+        #: continuing into a different mutation.
+        self.corpus_digest = None
+        self.corpus_manifest = None
+        self.corpus_path = None
+        self.mutation_mode = None
+        self.mutations_per_seed = None
+        #: body ceiling: a tag mutation that would exceed it falls back to
+        #: havoc, so the value changes which mutation a given case index names.
+        self.max_body_size = None
+        #: seed-mode only: how cases are allocated across a pair's seeds.
+        #: Part of what an index means, so a resume must not silently change it.
+        self.seed_order = None
         for k, v in fields.items():
             if hasattr(self, k):
                 setattr(self, k, v)
@@ -66,9 +90,11 @@ class RunState(object):
     # ------------------------------------------------------------
     def as_dict(self):
         return {k: getattr(self, k) for k in (
-            "version", "request", "group", "service", "raw_body", "seed",
-            "index_start", "index_end", "depth1_cases", "last_case",
-            "cases_run", "started", "updated", "db_file", "surface_file")}
+            "version", "request", "group", "service", "raw_body", "mode",
+            "seed", "index_start", "index_end", "depth1_cases", "last_case",
+            "cases_run", "started", "updated", "db_file", "surface_file",
+            "corpus_digest", "corpus_manifest", "corpus_path", "mutation_mode",
+            "mutations_per_seed", "max_body_size", "seed_order")}
 
     @classmethod
     def load(cls, path):
@@ -78,9 +104,15 @@ class RunState(object):
         for k, v in data.items():
             if hasattr(st, k):
                 setattr(st, k, v)
-        if st.version != VERSION:
+        # Version 1 predates seed mode.  It is safe to read: every v1 field has
+        # the same meaning, and a model run is exactly mode="model".  Writing it
+        # back upgrades the file to v2.
+        if st.version not in (1, VERSION):
             raise ValueError("run state %s is version %r, this build writes %r"
                              % (path, st.version, VERSION))
+        if st.version == 1:
+            st.mode = "model"
+            st.version = VERSION
         return st
 
     def save(self):
@@ -111,21 +143,29 @@ class RunState(object):
 
     # ------------------------------------------------------------
     def describe(self):
-        return ("%s group=%s service=%s raw_body=%s seed=%s depth1=%s "
+        return ("%s mode=%s group=%s service=%s raw_body=%s seed=%s depth1=%s "
                 "case %s/%s (%s run)"
-                % (self.request, self.group, self.service, self.raw_body,
-                   self.seed, self.depth1_cases, self.last_case,
+                % (self.request, self.mode, self.group, self.service,
+                   self.raw_body, self.seed, self.depth1_cases, self.last_case,
                    self.index_end, self.cases_run))
 
-    def conflicts_with(self, request, group, service, raw_body):
+    def conflicts_with(self, request, group, service, raw_body, mode=None,
+                       corpus_digest=None):
         """Whether the CLI asks for something other than what was recorded."""
         for name, recorded, asked in (("request", self.request, request),
                                       ("group", self.group, group),
                                       ("service", self.service, service),
-                                      ("raw_body", self.raw_body, raw_body)):
+                                      ("raw_body", self.raw_body, raw_body),
+                                      ("mode", self.mode, mode)):
             if asked is not None and asked != recorded:
                 return ("%s: state has %r, this command asks for %r"
                         % (name, recorded, asked))
+        # A seed-mode case index is (seed, local mutation) under a fixed corpus
+        # order.  A different corpus means index N is a different packet.
+        if (corpus_digest is not None and self.corpus_digest is not None
+                and corpus_digest != self.corpus_digest):
+            return ("corpus: state has %s, this command loads %s"
+                    % (self.corpus_digest[:12], corpus_digest[:12]))
         return None
 
     def resume_index(self):

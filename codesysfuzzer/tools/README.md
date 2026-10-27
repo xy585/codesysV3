@@ -1,5 +1,29 @@
 # tools/
 
+## `extract_seeds.py` — turn a capture into a seed corpus
+
+Reads a pcap/pcapng and writes one JSON file per request body, ready for
+`--from-seeds`.  It handles both framings the repository's captures contain:
+
+* TCP block driver (`CmpBlkDrvTcp`, port 11740): 8-byte BD header per frame,
+  datagram, channel frames, services;
+* UDP flash gateway (`CmpBlkDrvUdp`, ports 1740-1743): the datagram is the
+  packet, reusing `codesys_udp_ds.parse_datagram/parse_channel`.
+
+Only requests are kept (the runtime marks a reply with bit 7 of the group), and
+only the services **body** is written — session id, token and block counters are
+one connection's state.  Multi-frame messages are reassembled before writing.
+
+```
+python tools/extract_seeds.py trace2.pcapng -o seeds/
+python tools/extract_seeds.py trace2.pcapng -o seeds/ --group 0x0f
+python tools/extract_seeds.py trace2.pcapng -o seeds/ --jsonl all.jsonl
+```
+
+Needs `scapy` (optional; the fuzzer itself does not).  The default is to inspect
+every TCP/UDP stream and let the block-driver magic decide — the runtime and the
+gateway do not share a port.
+
 ## `extract_service_tags.py` — recover the (group, service) → tag-id map
 
 Walks the runtime's dispatch in IDA and emits a draft table of which tag ids each

@@ -1,0 +1,8 @@
+{
+  "group": "0x000f",
+  "service": "0x0007",
+  "body": "40848000a05143044a84800013170000",
+  "source": "trace2.pcapng#pkt3094",
+  "verdict": "captured",
+  "sha1": "152a4c0d76b6ad033cc8a47cd69e494b691188d6"
+}

@@ -74,14 +74,18 @@ CLI ──► Fuzzer ──► boofuzz Session ──► CodesysConnection ─�
 |---|---|---|
 | `proto.py` | 96 | `sys.path` 引导 + 重新导出 `codesys_tcp.py` 的协议层。**不复写任何已验证的编码**，`codesys_tcp.py` 本身不改动。 |
 | `utils.py` | 543 | 核心机制：`Leb128Size`、`LyingLeb128Size`、`FrameEncoder`、`RunRandom`（按运行种子）、请求骨架、group 表。 |
-| `services.py` | 603 | 26 个 request model + 分级黑盒模式；`REQUESTS` 注册表。 |
+| `services.py` | 603+ | 26 个 request model + 分级黑盒模式；`REQUESTS` 注册表。 |
+| `corpus.py` | 新增 | 种子语料：真实 body + pair 元数据，sha1 去重、稳定排序、digest/manifest。 |
+| `mutator.py` | 新增 | 数据驱动变异：raw 字节 havoc、structured tag 树变异、mixed hybrid；每 case 确定性。 |
 | `transport.py` | 701 | `SessionState`、握手、**持久 channel**、回复读取、keepalive 回显、backpressure 分类、崩溃探针。 |
-| `monitor.py` | 670 | `BaseMonitor` 实现：读回复、判活、服务面记录、崩溃报告落盘。 |
-| `fuzzer.py` | 284 | boofuzz 装配：Target / Session / 回调 / 日志策略。 |
-| `runstate.py` | 129 | 运行状态（JSON）：断点续跑与种子记录。原子写。 |
-| `codesys_fuzzer.py` | 835 | CLI：单模型 / `--all` / `--all-groups` / `--from-pairs` / dry-run。 |
-| `test_framing.py` | 334 | 离线逐字节回归（66 断言）。 |
-| `test_surface.py` | 446 | 离线：pair 记录、tag 种子、运行状态、崩溃报告（65 断言）。 |
+| `monitor.py` | 670+ | `BaseMonitor` 实现：读回复、判活、服务面记录、崩溃报告落盘、accepted body 回灌。 |
+| `fuzzer.py` | 284+ | boofuzz 装配：Target / Session / 回调 / 日志策略；三种 body 源（model / seed / static）。 |
+| `runstate.py` | 129+ | 运行状态（JSON）：断点续跑、种子记录、语料 digest。原子写。 |
+| `codesys_fuzzer.py` | 835+ | CLI：单模型 / `--all` / `--all-groups` / `--from-pairs` / `--from-seeds` / `--replay` / dry-run。 |
+| `test_framing.py` | 334 | 离线逐字节回归（67 断言）。 |
+| `test_surface.py` | 446 | 离线：pair 记录、tag 种子、运行状态、崩溃报告（74 断言）。 |
+| `test_seed.py` | 新增 | 离线：语料去重/排序、tag 编解码、变异确定性、SeedBody 索引映射、多帧重组（54 断言）。 |
+| `tools/extract_seeds.py` | 新增 | 从 pcap/pcapng 提取请求 body（TCP block driver + UDP gateway）。 |
 | `tools/extract_service_tags.py` | 378 | IDAPython：从二进制推导服务/标签表（在 GUI 里跑）。 |
 | `tools/summarise_surface.py` | 166 | 把 surface 文件汇总成服务地图。 |
 
@@ -131,7 +135,17 @@ CODESYS 对叶子 tag 的长度用 **3 字节** LEB128（4 → `84 80 00`），�
 ### 4.5 断点续跑
 
 `<log-dir>/<request>.state.json` 记录请求、group/service、**种子**、最后 case。
-每 25 case 原子写一次（临时文件 + `os.replace`），中断不会留下半截索引。
+第一个完成的 case 后、每 25 case、以及运行结束时各原子写一次（临时文件 +
+`os.replace`），中断不会留下半截索引。注意 `last_case`/`cases_run` 只统计**已完成**
+的 case：状态文件为 0 表示该 pair 连会话都没建立，不是没写盘。
+
+seed 模式额外记录 `corpus_path`/`corpus_digest`/`corpus_manifest`/
+`mutation_mode`/`mutations_per_seed`/`max_body_size`/`seed_order`。resume 用
+记录值重建同一枚举；语料、预算、顺序或 body 上限任一变化都会拒绝，因为 case N
+会指向另一个包。进度**写回被 resume 的那个文件**，不会另建
+`<log-dir>/<request>.state.json`。批量 `--from-seeds` 在中断、崩溃或拿不到会话时
+停止，并打印该 pair 的 `--resume` 命令；再次执行同一条命令会**逐 pair 自动
+resume**（连运行种子一起恢复），`--force-new` 才是从头开始。
 
 ### 4.6 崩溃报告
 
@@ -246,15 +260,27 @@ python codesysfuzzer/codesys_fuzzer.py 192.168.125.129 --all-groups
 # 按 pair 文件定向 fuzz
 python codesysfuzzer/codesys_fuzzer.py 192.168.125.129 --from-pairs logs/service_surface.jsonl
 
+# 数据驱动：真实 body 种子变异
+python codesysfuzzer/codesys_fuzzer.py 192.168.125.129 -r trace_configure \
+    --dry-run --send --save-seed seeds/          # 从模型默认 body 采集种子
+python codesysfuzzer/tools/extract_seeds.py trace2.pcapng -o seeds/
+python codesysfuzzer/codesys_fuzzer.py 192.168.125.129 --from-seeds seeds/ \
+    --mutate structured --cases 5000
+python codesysfuzzer/codesys_fuzzer.py 192.168.125.129 \
+    --replay logs/seed_0f_0002_crash_*.json
+
 # 断点续跑
 python codesysfuzzer/codesys_fuzzer.py 192.168.125.129 --resume logs/trace_configure.state.json
 
 # 离线测试
-python codesysfuzzer/test_framing.py && python codesysfuzzer/test_surface.py
+python codesysfuzzer/test_framing.py && python codesysfuzzer/test_surface.py \
+    && python codesysfuzzer/test_seed.py
 ```
 
 关键 flag：`--surface {global,separate,off}`、`--seed`、`--state`、`--resume`、
-`--from-pairs`、`--pairs-only`、`--log-payloads`、`--reply-timeout`、`--force-new`。
+`--from-pairs`、`--pairs-only`、`--from-seeds`、`--mutate {raw,structured,hybrid}`、
+`--mutations-per-seed`、`--max-body-size`、`--seed-order`、`--save-seed`、
+`--capture-seeds`、`--replay`、`--log-payloads`、`--reply-timeout`、`--force-new`。
 
 ---
 
@@ -262,20 +288,26 @@ python codesysfuzzer/test_framing.py && python codesysfuzzer/test_surface.py
 
 ### 8.1 已验证
 
-- **离线 131 个断言**：未变异的 `trace_configure` body 与抓包**逐字节相同**；完整
-  TCP 帧与 `codesys_tcp.py` 构造的一致；分片与 `send_blk` 逐帧一致；渲染确定性；
-  每个 model 都能构建且有变异；pair 记录/种子/状态/崩溃报告的规则。
+- **离线 266 个断言**（framing 67 + surface 133 + seed 66）：未变异的
+  `trace_configure` body 与抓包**逐字节相同**；完整 TCP 帧与 `codesys_tcp.py`
+  构造的一致；分片与 `send_blk` 逐帧一致；渲染确定性；每个 model 都能构建且有
+  变异；pair 记录/种子/状态/崩溃报告的规则；tag 树解析→重编码逐字节回环；
+  seed 变异确定性与索引映射；多帧 body 重组。
 - **实测被运行时接受**：`trace_list`、`trace_configure`、6 个 CmpAppBP model、
   3 个 CmpAppForce model（`--dry-run --send`）。
 - **长会话**：434 case / 434 回复 / **1 次握手**。
 - **种子确定性**：同 `--case --seed` 两次发出的帧字节完全一致；换种子即不同。
 - **服务地图**：单 group 0x12 与反汇编给出的 9 个服务**完全吻合**。
+- **pcap 提取**：`trace2.pcapng` 解析出 237 个请求 / 62 个唯一 body / 21 个 pair，
+  其中 `0x0f/0x0002` 与手工抓出的 `TRACE_CFG_TEMPLATE` sha1 相同。
 
 ### 8.2 未完成
 
 - **第 1 项（推导全部 service 的 body）**：19 个 group 中完成 2 个（CmpAppBP 5 个
   service、CmpAppForce 3 个）。剩余工作与读法见 `DERIVED_MODELS.md`。
-- **组合变异**（tag id × 声明长度 × 内容）未实现。
+- **model 的跨字段组合变异**（tag id × 声明长度 × 内容）仍未实现。数据驱动的
+  `hybrid` 模式会在一个 case 里叠加多个字节算子，但那是基于 seed 的，不替代
+  语法模型的组合枚举。
 - 完整服务地图需要重跑 `--all-groups`（上一批 surface 文件已丢失）。
 
 ### 8.3 首次崩溃记录（**待归因**）
@@ -317,6 +349,12 @@ python codesysfuzzer/codesys_fuzzer.py 192.168.125.129 -r trace_configure \
    推断，只有一个 pair 时众数就是它自己，会把"真实但拒绝了当前 body"的 pair 滤掉。
    修法：兜底码改为从二进制取常量表，或每组探一次。
 6. 默认不记录 payload（`--log-payloads` 恢复）；崩溃那一条始终完整记录。
+7. **seed 的配对是硬的**：body 只对采集它的 `(group, service)` 有意义；换 handler
+   需要显式的 shape-router 式实验，`--from-seeds` 不做自动跨组重放。
+8. **seed 运行中不扩充活跃语料**：`--capture-seeds` 只写 `candidates/`，下一轮才
+   导入。否则 case index → mutation 的映射会在运行中变化，断点和复现都会失效。
+9. **语料 digest 是整份语料的**，不是单 pair 子集：给别的 pair 加一个 seed 也会
+   让当前 pair 的 resume 被拒。这是保守选择，宁可重跑也不静默换包。
 
 ---
 

@@ -27,7 +27,9 @@ import struct
 from boofuzz import FuzzLoggerText, Session, Target
 
 from monitor import CodesysMonitor
-from services import build_request, request_names
+from services import (
+    build_request, build_seed_request, build_static_request, request_names,
+)
 from transport import CodesysConnection
 from utils import _s_update
 
@@ -144,7 +146,8 @@ class Fuzzer(object):
                  surface_mode="global", state=None, state_every=25, seed_tags=None,
                  crash_dir=None, seed=None, db_path=None,
                  log_payloads=False, record_blocks=None, record_path=None,
-                 reply_timeout=2.0, **connection_kwargs):
+                 reply_timeout=2.0, seed_body=None, static_body=None,
+                 capture_seeds=None, crash_grace=10.0, **connection_kwargs):
         self.target_ip = target_ip
         self.target_port = target_port
         self.request_name = request_name
@@ -173,6 +176,14 @@ class Fuzzer(object):
         self.state = state
         self.state_every = max(1, state_every)
         self.reply_timeout = reply_timeout
+        #: mutually exclusive body sources.  model -> grammar primitives,
+        #: seed_body -> mutation of captured bodies, static_body -> one body
+        #: verbatim (--replay).
+        self.seed_body = seed_body
+        self.static_body = static_body
+        self.capture_seeds = capture_seeds
+        #: how long the post-run watch polls the listener for a delayed crash
+        self.crash_grace = crash_grace
         self.connection_kwargs = connection_kwargs
 
         self.session = None
@@ -205,7 +216,10 @@ class Fuzzer(object):
                                       target=self.target_ip,
                                       seed=self.seed,
                                       db_path=self.db_path,
-                                      reply_timeout=self.reply_timeout)
+                                      reply_timeout=self.reply_timeout,
+                                      seed_body=self.seed_body,
+                                      capture_seeds=self.capture_seeds,
+                                      crash_grace=self.crash_grace)
         self.target = Target(connection=self.connection,
                              monitors=[self.monitor])
 
@@ -274,10 +288,20 @@ class Fuzzer(object):
                 db_logger._data_truncate_length = 0
 
     def _init_protocol_structure(self):
-        self.request = build_request(self.request_name, self.connection.state,
-                                     group=self.group, service=self.service,
-                                     raw_body=self.raw_body,
-                                     seed_tags=self.seed_tags)
+        if self.static_body is not None:
+            self.request = build_static_request(
+                self.request_name, self.connection.state,
+                self.group, self.service, self.static_body)
+        elif self.seed_body is not None:
+            self.request = build_seed_request(
+                self.request_name, self.connection.state,
+                self.group, self.service, self.seed_body)
+        else:
+            self.request = build_request(self.request_name,
+                                         self.connection.state,
+                                         group=self.group, service=self.service,
+                                         raw_body=self.raw_body,
+                                         seed_tags=self.seed_tags)
         self._install_block_recorder()
 
     def _install_block_recorder(self):
@@ -352,7 +376,11 @@ class Fuzzer(object):
         self.state.cases_run += 1
         self.state.last_case = getattr(session, "total_mutant_index",
                                        self.state.last_case)
-        if self.state.cases_run % self.state_every == 0:
+        # Persist the first completed case as well as every Nth: a short run
+        # killed hard (window closed, task manager) then has a resume point
+        # instead of looking like it never started.
+        if (self.state.cases_run == 1
+                or self.state.cases_run % self.state_every == 0):
             self.state.save()
 
     def pre_actions(self):
@@ -380,12 +408,28 @@ class Fuzzer(object):
         # here puts the exception where it can be reported.  CodesysConnection's
         # open() is idempotent, so boofuzz's own open() is then a no-op rather
         # than a second handshake.
-        self.connection.open()
         try:
+            self.connection.open()
             self.session.fuzz()
         finally:
+            # Includes a failed initial handshake: the state is written before
+            # the run starts in the CLI, but saving here keeps the file's
+            # "updated" stamp honest and covers an open() that fails after a
+            # resume point has already been chosen.
             if self.state is not None:
                 self.state.save()
+
+        # Probe once more now that the loop has stopped.  ``post_send`` only
+        # probes on a cadence (``--probe-every``, default 50) and the run stops
+        # at its configured index, so a crash in the last cases of a run is
+        # never checked there — and a one-case reproduction is entirely inside
+        # that window.  This also catches the "silent" exit where a dead
+        # runtime makes the next case's handshake fail: boofuzz swallows that
+        # exception, so the loop returns looking like a finished run.
+        # Exceptions (interrupt, restart failure) skip the call: in those cases
+        # the run did not end cleanly and the operator already has a reason.
+        if self.monitor is not None:
+            self.monitor.check_liveness()
 
 
 __all__ = ["Fuzzer", "request_names"]

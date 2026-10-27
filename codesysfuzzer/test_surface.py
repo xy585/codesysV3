@@ -331,6 +331,16 @@ def test_run_state(tmp):
     check("still valid after a second save",
           RunState.load(path).last_case, 87)
 
+    print("\n[13b] the per-seed budget and order are part of an index")
+    st2 = RunState(path=path, request="seed_0f_0002", mode="seed",
+                   mutations_per_seed=100000, mutation_mode="structured",
+                   seed_order="round-robin")
+    st2.save()
+    back2 = RunState.load(path)
+    check("budget round-trips", back2.mutations_per_seed, 100000)
+    check("mode round-trips", back2.mutation_mode, "structured")
+    check("order round-trips", back2.seed_order, "round-robin")
+
 
 def _unhex(nodes):
     """The hex-encoded tree as ints, for comparison with the loader's output."""
@@ -461,6 +471,302 @@ def test_block_recorder(tmp):
     check_true("recording the request itself is refused", ok, detail)
 
 
+def test_final_probe(tmp):
+    print("\n[19] a crash in the last cases is caught by the end-of-run probe")
+    from monitor import CodesysMonitor
+
+    body = (tag(0x10, bytes(12)) + parent_tag(0x86, tag(0x30, b"A" * 64)))
+    frame = frame_with(0x0F, 0x0002, body)
+
+    class Link(object):
+        """``probe()`` only — the monitor needs nothing else here.
+
+        ``fail_after`` is the number of probes that still answer; it models the
+        real crash, where the listener stays up for a few seconds after the
+        request that kills the process and then goes away.  Timing-based tests
+        would be flaky, so this is driven by call count instead of the clock.
+        """
+        broken = False
+        break_reason = None
+        info = "10.0.0.5:11740"
+
+        def __init__(self, alive=True, fail_after=None):
+            self.alive = alive
+            self.fail_after = fail_after
+            self.probes = 0
+
+        def probe(self, timeout=2.0):
+            self.probes += 1
+            alive = self.alive and (self.fail_after is None
+                                    or self.probes <= self.fail_after)
+            return alive, ("" if alive else "ConnectionRefusedError: refused")
+
+    crash_dir = os.path.join(tmp, "final")
+    os.makedirs(crash_dir, exist_ok=True)
+
+    # 2 cases over probe_every=50: post_send never probes on a cadence here,
+    # which is exactly the window a one-case reproduction lives in.
+    dead = Link(False)
+    mon = CodesysMonitor(dead, enabled=True, probe_every=50,
+                         crash_dir=crash_dir, request_name="trace_configure",
+                         target="10.0.0.5", seed=4242)
+    mon.cases = 2
+    mon._last_case_index = 297
+    mon._last_send = frame
+    check("a dead runtime is found", mon.check_liveness(grace=0), False)
+    check("and the probe ran", dead.probes, 1)  # the first probe already failed
+    check_true("crash recorded", mon.crash is not None)
+    check("crash names the last case", mon.crash["case"], 297)
+    check_true("crash report written", bool(mon.crash.get("files")))
+    txt = open(mon.crash["files"] + ".txt", encoding="utf-8").read()
+    check_true("repro command can run past the state guard",
+               "--force-new" in txt)
+    check("a second call does not double-probe", mon.check_liveness(grace=0),
+          True)
+
+    # the measured shape: alive at the end of the run, gone a few seconds on
+    delayed = Link(fail_after=2)
+    mon2 = CodesysMonitor(delayed, enabled=True, probe_every=50,
+                          crash_dir=crash_dir, request_name="trace_configure",
+                          target="10.0.0.5", seed=4242)
+    mon2.cases = 1
+    mon2._last_case_index = 296
+    mon2._last_send = frame
+    check("a delayed death is found",
+          mon2.check_liveness(grace=10, interval=0), False)
+    check("it took three polls", delayed.probes, 3)
+    check_true("and is reported as the final probe",
+               "final probe" in mon2.crash["reason"])
+
+    live = Link()
+    mon3 = CodesysMonitor(live, enabled=True, probe_every=50,
+                          crash_dir=crash_dir, request_name="trace_configure",
+                          target="10.0.0.5", seed=4242)
+    mon3.cases = 2
+    mon3._last_case_index = 297
+    mon3._last_send = frame
+    check("a live runtime is not a crash", mon3.check_liveness(grace=0), True)
+    check_true("no crash recorded", mon3.crash is None)
+    check("the window was probed", live.probes, 1)
+
+    off = Link(False)
+    mon4 = CodesysMonitor(off, enabled=False, crash_dir=crash_dir,
+                          request_name="trace_configure", target="10.0.0.5",
+                          seed=4242)
+    mon4.cases = 2
+    check("--no-probe means no probe", mon4.check_liveness(grace=0), True)
+    check("and nothing was probed", off.probes, 0)
+
+    none = Link(False)
+    mon5 = CodesysMonitor(none, enabled=True, crash_dir=crash_dir,
+                          request_name="trace_configure", target="10.0.0.5",
+                          seed=4242)
+    check("no case ran, nothing to attribute", mon5.check_liveness(grace=0),
+          True)
+    check("and nothing was probed", none.probes, 0)
+
+
+def test_stale_send_attribution(tmp):
+    print("\n[20] a failed send is not attributed to the case index that failed")
+    from monitor import CodesysMonitor
+
+    body_a = tag(0x10, b"A" * 12)
+    body_b = tag(0x10, b"B" * 12)
+    frame_a = frame_with(0x0F, 0x0002, body_a)
+    frame_b = frame_with(0x0F, 0x0002, body_b)
+
+    class Conn(object):
+        broken = False
+        break_reason = None
+        info = "10.0.0.5:11740"
+        last_case = None
+
+        def __init__(self):
+            self.n = 0
+
+        def service_reply(self, timeout=2.0):
+            return None, True
+
+        def probe(self, timeout=2.0):
+            self.n += 1
+            # healthy on the first case, gone on the second
+            return (self.n == 1), ("" if self.n == 1 else "refused")
+
+    class Sess(object):
+        def __init__(self, index, sent):
+            self.total_mutant_index = index
+            self.last_send = sent
+
+    conn = Conn()
+    crash_dir = os.path.join(tmp, "stale")
+    os.makedirs(crash_dir, exist_ok=True)
+    mon = CodesysMonitor(conn, enabled=True, probe_every=1,
+                         crash_dir=crash_dir,
+                         request_name="seed_0f_0002", target="10.0.0.5",
+                         seed=7)
+    # case 1 sends frame A
+    check("case 1 is healthy", mon.post_send(session=Sess(1, frame_a)), True)
+    check("case 1 recorded", mon._last_case_index, 1)
+    check("its bytes recorded", mon._last_send is frame_a, True)
+
+    # case 2's send failed: boofuzz still reports frame A as last_send
+    check("case 2 detected the crash",
+          mon.post_send(session=Sess(2, frame_a)), False)
+    check("attributed to the last case that really went out",
+          mon.crash["case"], 1)
+    check("with that case's bytes", mon._last_send is frame_a, True)
+    check("and not case 2's index", mon.crash["case"] != 2, True)
+
+    data = json.load(open(mon.crash["files"] + ".json", encoding="utf-8"))
+    check("the report carries the sent body", data["body_hex"],
+          body_a.hex())
+    check("and the plan is for the same case", data["case"], 1)
+    check("the trail has the packet that went out", len(data.get("recent") or []), 1)
+    check("the trail names its case", data["recent"][0]["case"], 1)
+    check("the trail carries its body", data["recent"][0]["body_hex"],
+          body_a.hex())
+
+    # a real new send does advance the attribution
+    stale2 = os.path.join(tmp, "stale2")
+    os.makedirs(stale2, exist_ok=True)
+    mon2 = CodesysMonitor(Conn(), enabled=True, probe_every=1,
+                          crash_dir=stale2,
+                          request_name="seed_0f_0002", target="10.0.0.5",
+                          seed=7)
+    mon2.post_send(session=Sess(1, frame_a))
+    mon2.post_send(session=Sess(2, frame_b))
+    check("a successful send advances the index", mon2._last_case_index, 2)
+    check("and the bytes", mon2._last_send is frame_b, True)
+
+
+def test_seed_prefix_report(tmp):
+    print("\n[21] a seed report embeds what is needed to replay the prefix")
+    from corpus import Corpus, Seed, write_seed
+    from monitor import CodesysMonitor
+    from utils import SeedBody
+
+    body = (tag(0x10, b"App.Trace\x00\x00\x00")
+            + parent_tag(0x86, tag(0x30, b"\x0a\x00\x00\x00")))
+    run_seed = 1234
+    sb = SeedBody([Seed(0x0F, 0x0002, body)], run_seed, mode="structured",
+                  mutations_per_seed=64, max_body_size=65536)
+    frame = frame_with(0x0F, 0x0002, body)
+
+    crash_dir = os.path.join(tmp, "seedrun")
+    os.makedirs(crash_dir, exist_ok=True)
+    mon = CodesysMonitor(None, enabled=True, crash_dir=crash_dir,
+                         request_name="seed_0f_0002", target="10.0.0.5",
+                         seed=run_seed, seed_body=sb)
+    mon.cases = 7
+    mon._last_case_index = 7
+    mon._last_send = frame
+    mon.crash = {"case": 7, "cases_run": 7, "when": "x", "reason": "probe",
+                 "send_len": len(frame)}
+    base = mon._write_crash_files()
+    data = json.load(open(base + ".json", encoding="utf-8"))
+    sr = data.get("seed_run")
+    check_true("seed_run present", isinstance(sr, dict))
+    check("cases to replay", sr["cases"], 7)
+    check("segment start recorded", sr.get("start"), 1)
+    check("run seed kept", sr["run_seed"], run_seed)
+    check("mutation mode kept", sr["mode"], "structured")
+    check("per-seed budget kept", sr["mutations_per_seed"], 64)
+    check("corpus size", len(sr["seeds"]), 1)
+    check("corpus body kept", bytes.fromhex(sr["seeds"][0]["body"]), body)
+    txt = open(base + ".txt", encoding="utf-8").read()
+    check_true("report offers the prefix fallback", "--replay-prefix" in txt)
+    check_true("report keeps the single body as the default",
+               "sends the last body" in txt)
+
+    # Rebuilding from the report's own data must regenerate the same packets
+    # for every case in the prefix; that is the whole point of the embedding.
+    rebuilt_dir = os.path.join(tmp, "rebuilt")
+    for row in sr["seeds"]:
+        write_seed(rebuilt_dir, int(row["group"], 16),
+                   int(row["service"], 16), bytes.fromhex(row["body"]))
+    rebuilt = Corpus.load(rebuilt_dir)
+    sb2 = SeedBody(list(rebuilt.by_pair()[(0x0F, 0x0002)]),
+                   sr["run_seed"], mode=sr["mode"],
+                   mutations_per_seed=sr["mutations_per_seed"],
+                   max_body_size=sr["max_body_size"], order=sr["order"])
+    same = all(sb._mutate(sb.seeds[0], i)[0] == sb2._mutate(sb2.seeds[0], i)[0]
+               for i in range(1, 8))
+    check_true("the replay regenerates the same bodies", same)
+
+
+def test_case_report(tmp):
+    print("\n[22] a confirmed case can be written out like a crash report")
+    import types
+    from codesys_fuzzer import write_case_report
+    from corpus import Seed
+    from utils import SeedBody
+
+    body = (tag(0x10, b"App.Trace\x00\x00\x00")
+            + parent_tag(0x86, parent_tag(0x83,
+                                         tag(0x26, b"A" * 32))))
+    run_seed = 1234
+    sb = SeedBody([Seed(0x0F, 0x0002, body)], run_seed, mode="structured",
+                  mutations_per_seed=64, max_body_size=65536)
+    plan = sb.plan_for_case(7)
+    frame = frame_with(0x0F, 0x0002, body)
+    report = {
+        "request": "seed_0f_0002", "case": 7, "cases_run": 7,
+        "group": "0x000f", "service": "0x0002", "seed": run_seed,
+        "database": "logs/x.db", "body_hex": body.hex(),
+        "sent_hex": frame.hex(), "seed_plan": plan,
+        "seed_run": {
+            "run_seed": run_seed, "mode": "structured",
+            "mutations_per_seed": 64, "max_body_size": 65536,
+            "order": "contiguous", "start": 1, "cases": 7,
+            "seeds": [{"group": "0x000f", "service": "0x0002",
+                       "body": body.hex()}],
+        },
+        "recent": [{"case": 7, "group": "0x000f", "service": "0x0002",
+                    "body_hex": body.hex(), "sent_hex": frame.hex(),
+                    "seed_plan": plan}],
+    }
+    rep_path = os.path.join(tmp, "case_report.json")
+    with open(rep_path, "w", encoding="utf-8") as fh:
+        json.dump(report, fh)
+
+    args = types.SimpleNamespace(replay=rep_path, case_report=7,
+                                 case_report_out=None, target="10.0.0.5")
+    check("case report written", write_case_report(args, report), 0)
+    default = os.path.splitext(rep_path)[0] + "_case_7.txt"
+    check_true("default path sits next to the report", os.path.exists(default))
+    text = open(default, encoding="utf-8").read()
+    check_true("names the case", "case         : 7" in text)
+    check_true("has the structured request section",
+               "Structured request" in text)
+    check_true("shows the container", "0x86" in text)
+    check_true("shows the grown tag", "0x26" in text)
+    check_true("has the mutation plan", "value_grow" in text or "Seed mutation" in text)
+    check_true("has the raw body section",
+               "Raw bytes (services body" in text)
+    check_true("has the recorded frame",
+               "block driver + datagram" in text
+               and " ".join("%02x" % b for b in frame[:8]) in text)
+
+    # a case outside the recent trail is rebuilt from the embedded corpus
+    args2 = types.SimpleNamespace(replay=rep_path, case_report=5,
+                                  case_report_out=os.path.join(tmp, "c5.txt"),
+                                  target="10.0.0.5")
+    check("rebuilt case report written", write_case_report(args2, report), 0)
+    text2 = open(args2.case_report_out, encoding="utf-8").read()
+    check_true("says it was rebuilt", "embedded seed corpus" in text2)
+    check_true("rebuilt body is rendered", "Structured request" in text2)
+    check_true("no frame is invented", "not recorded for this case" in text2)
+
+    # a case outside both sources and with no corpus cannot be produced
+    bare = dict(report)
+    bare.pop("seed_run")
+    bare.pop("recent")
+    args3 = types.SimpleNamespace(replay=rep_path, case_report=5,
+                                  case_report_out=os.path.join(tmp, "c6.txt"),
+                                  target="10.0.0.5")
+    check("unknown case is refused", write_case_report(args3, bare), 2)
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="surface_test_")
     print("=" * 70)
@@ -480,6 +786,10 @@ def main():
         test_seeded_body()
         test_block_recorder(tmp)
         test_crash_report(tmp)
+        test_final_probe(tmp)
+        test_stale_send_attribution(tmp)
+        test_seed_prefix_report(tmp)
+        test_case_report(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print("\n" + "=" * 70)

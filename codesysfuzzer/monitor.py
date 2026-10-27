@@ -7,6 +7,13 @@ boofuzz's contract is simple: a monitor whose ``post_send`` returns ``False``
 marks the test case as crashing, and ``get_crash_synopsis`` supplies the report.
 So the whole job here is deciding *when* the runtime is dead.
 
+Two checks, not one.  The per-case probe runs on a cadence (``probe_every``)
+and after a broken session; :meth:`CodesysMonitor.check_liveness` runs again
+once the fuzz loop has stopped.  The second one exists because a run ends at
+its configured index, not on a cadence boundary: without it, a crash among the
+last ``probe_every - 1`` cases — which is where the whole of a single-case
+reproduction lives — would finish the run reporting "no crash detected".
+
 The probe is a short-timeout TCP connect to the block driver port.  If nothing
 answers, the process is gone — that is the signal this fuzzer is built around,
 and it is the reason the transport is TCP rather than UDP: CmpBlkDrvTcp gets a
@@ -28,6 +35,7 @@ import time
 
 from boofuzz.monitors.base_monitor import BaseMonitor
 
+from corpus import write_seed
 from proto import (
     BD_MAGIC, parse_channel, parse_datagram, parse_services, parse_tags,
     status_of,
@@ -35,27 +43,46 @@ from proto import (
 
 
 def parse_sent_parts(data):
-    """``(group, service, body)`` for a sent frame, or ``(None, None, None)``.
+    """``(group, service, body)`` for a sent request, or ``(None, None, None)``.
 
     Needed because in a sweep the ids that went out are the *mutated* ones, not
     the model's defaults — reading them back off the wire is simpler and more
-    trustworthy than threading the mutation context through.  Only the first
-    frame is inspected; the services header and the start of the body are in it
-    either way.
+    trustworthy than threading the mutation context through.
+
+    The body is reassembled across every ``blk_first``/``blk_cont`` frame.  A
+    mutated body can be several KB, and a caller capturing it as a seed or
+    replaying it needs all of it, not the first frame's 468 bytes.
     """
     if not data or len(data) < 8 + 20:
         return None, None, None
+    position = 0
+    buffer = bytearray()
+    declared = None
     try:
-        magic, length = struct.unpack_from("<II", data, 0)
-        if magic != BD_MAGIC or length < 8 or length > len(data):
+        while position + 8 <= len(data):
+            magic, length = struct.unpack_from("<II", data, position)
+            if (magic != BD_MAGIC or length < 8
+                    or position + length > len(data)):
+                break
+            dg = parse_datagram(data[position + 8:position + length])
+            if dg is None:
+                break
+            ch = parse_channel(dg["payload"])
+            kind = ch.get("type")
+            if kind == "blk_first":
+                declared = ch.get("data_size") or 0
+                buffer = bytearray(ch["data"])
+            elif kind == "blk_cont" and declared is not None:
+                buffer.extend(ch["data"])
+            else:
+                position += length
+                continue
+            position += length
+            if declared is not None and len(buffer) >= declared:
+                break
+        if declared is None:
             return None, None, None
-        dg = parse_datagram(data[8:length])
-        if dg is None:
-            return None, None, None
-        ch = parse_channel(dg["payload"])
-        if ch.get("type") not in ("blk_first", "blk_cont"):
-            return None, None, None
-        hdr, body = parse_services(ch["data"])
+        hdr, body = parse_services(bytes(buffer[:declared]))
         return hdr["group"], hdr["service_id"], body
     except (ValueError, struct.error, KeyError, IndexError):
         return None, None, None
@@ -375,7 +402,8 @@ class CodesysMonitor(BaseMonitor):
     def __init__(self, connection, probe_every=1, enabled=True, verbose=False,
                  surface_path=None, reply_timeout=2.0, surface_mode="global",
                  crash_dir=None, request_name=None, target=None, seed=None,
-                 db_path=None):
+                 db_path=None, seed_body=None, capture_seeds=None,
+                 crash_grace=10.0):
         super().__init__()
         self.connection = connection
         self.probe_every = max(1, probe_every)
@@ -389,6 +417,15 @@ class CodesysMonitor(BaseMonitor):
         self.seed = seed
         self.db_path = db_path
         self.reply_timeout = reply_timeout
+        #: set for seed-mode runs: used to recover the mutation plan behind a
+        #: crash, and to know that the reproduce recipe is ``--replay``, not a
+        #: case index.
+        self.seed_body = seed_body
+        #: directory that accepted bodies are copied into as candidate seeds
+        self.capture_seeds = capture_seeds
+        #: seconds to keep polling the listener after the run stops.  See
+        #: ``check_liveness``: the crash can trail the request by a few seconds.
+        self.crash_grace = max(0.0, crash_grace)
 
         self.cases = 0
         self.probes = 0
@@ -396,6 +433,17 @@ class CodesysMonitor(BaseMonitor):
         self.crash = None            # dict once a crash is detected
         self._last_send = None
         self._last_case_index = None
+        #: the last few requests that actually went out, oldest first.  A
+        #: delayed crash is first noticed after the packet that caused it, so
+        #: the report needs the candidates, not just the detection point.  This
+        #: is observation only: the fuzzer still sends nothing but its own
+        #: mutated bodies, and no runtime state is touched.
+        #: first case index of this invocation.  A resume is its own segment on
+        #: a freshly started runtime, so a faithful replay starts here, not at
+        #: case 1 (replaying from 1 would hit whatever crash ended the earlier
+        #: segment first).
+        self.run_start = 1
+        self.recent = collections.deque(maxlen=10)
 
     # ------------------------------------------------------------
     # BaseMonitor
@@ -410,8 +458,20 @@ class CodesysMonitor(BaseMonitor):
         """
         self.cases += 1
         if session is not None:
-            self._last_send = getattr(session, "last_send", None)
-            self._last_case_index = getattr(session, "total_mutant_index", None)
+            last = getattr(session, "last_send", None)
+            index = getattr(session, "total_mutant_index", None)
+            # ``session.last_send`` is set by boofuzz *after* a successful
+            # send.  When this case's send raised — which is exactly what
+            # happens once the runtime is gone — it still holds the previous
+            # case's bytes.  Pairing those bytes with this case's index is what
+            # produced a crash report naming case 44 and carrying case 43's
+            # body, so ``--replay`` sent the wrong packet and "did not
+            # reproduce".  Identity, not equality: every render returns a new
+            # bytes object, so the same object means no new send happened.
+            if last is not None and last is not self._last_send:
+                self._last_send = last
+                self._last_case_index = index
+                self.recent.append((index, last))
 
         if self.crash is not None:
             return True
@@ -447,12 +507,36 @@ class CodesysMonitor(BaseMonitor):
                 "VALID RESPONSE: group %s service %s accepted"
                 % (row["group"], row["service"]))
 
+        # Corpus feedback: a body the runtime answered is a new starting point
+        # for the next seed-mutation run.  Written to ``candidates`` rather than
+        # into the active corpus, because adding seeds mid-run would change the
+        # case-index -> mutation mapping the run is resuming against.
+        if (self.capture_seeds and row is not None
+                and row["verdict"] in ("accepted", "replied")):
+            group, service, sent_body = parse_sent_parts(self._last_send)
+            if group is not None and sent_body:
+                write_seed(os.path.join(self.capture_seeds, "candidates"),
+                           group, service, sent_body,
+                           source="case:%s:%s"
+                                  % (self.request_name, self._last_case_index),
+                           verdict=row["verdict"])
+
         if not self.enabled:
             return True
         # A broken session is the interesting case, so probe then regardless of
         # cadence; a healthy one is probed every Nth case to keep the overhead
         # off the hot path.
-        if not self.connection.broken and self.cases % self.probe_every:
+        #
+        # A *silent* case is probed too, whatever the cadence.  That is the
+        # only warning a stack-smash gives: the request is never answered, the
+        # process then spends a moment dying, and probing right here is what
+        # names the packet that did it.  Without this the death is first seen
+        # at the end of the run and the report blames the last case sent —
+        # measured: the real trigger was a tag-0x30 length lie three cases
+        # before the one that got recorded, so --replay sent a harmless packet.
+        silent = body is None and complete
+        if (not self.connection.broken and not silent
+                and self.cases % self.probe_every):
             return True
 
         self.probes += 1
@@ -460,14 +544,7 @@ class CodesysMonitor(BaseMonitor):
         if alive:
             return True
 
-        self.crash = {
-            "case": self._last_case_index,
-            "cases_run": self.cases,
-            "reason": why,
-            "when": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "send_len": len(self._last_send) if self._last_send else 0,
-        }
-        self._write_crash_files()
+        self._set_crash(why)
         if fuzz_data_logger is not None:
             fuzz_data_logger.log_fail(
                 "CODESYS runtime is gone after case %s: %s"
@@ -476,6 +553,64 @@ class CodesysMonitor(BaseMonitor):
                 fuzz_data_logger.log_info("crash report written to %s.txt / .json"
                                           % self.crash["files"])
         return False
+
+    def check_liveness(self, grace=None, interval=0.5):
+        """Watch the listener for a while once the fuzz loop has stopped.
+
+        The per-case probe is a *cadence* check (``probe_every``, default 50),
+        and a run ends at its configured index, not at a cadence boundary.  So
+        every case in the last ``probe_every - 1`` cases of a run — which is the
+        whole ``--case 296 --case-count 1`` reproduction command — is never
+        probed.  The run's own summary then says "no crash detected" about a
+        runtime that is gone.  The same call covers the other silent exit: when
+        a dead runtime makes the next case's handshake fail, boofuzz swallows
+        ``BoofuzzTargetConnectionFailedError`` and the loop returns as if the
+        run had completed normally.
+
+        The watch is a *window*, not a single probe, because this crash is not
+        synchronous with the request that triggers it: measured on
+        ``trace_configure`` case 296, the runtime answered the request, kept
+        the block-driver listener open while it processed the trace config,
+        and only then died — after the run had already closed its channel.
+        Three probes over two seconds all connected; the process was gone a
+        few seconds later.  So keep polling until the grace window expires.
+
+        Each poll is a bare TCP connect: no channel is allocated, nothing is
+        sent, so a live runtime pays only an accept/close.  A refused connect
+        is the crash signal — the whole process is gone, not just one handler.
+
+        Returns True when the runtime survived the window (or there is nothing
+        to check), False when *this* call is what found the crash.
+        """
+        if self.crash is not None or not self.enabled or self.cases == 0:
+            return True
+        if grace is None:
+            grace = self.crash_grace
+        deadline = time.monotonic() + max(0.0, grace)
+        if self.verbose and grace > 0:
+            print("[i] watching %s for a delayed crash for up to %gs"
+                  % (self.connection.info, grace))
+        while True:
+            self.probes += 1
+            alive, why = self.connection.probe()
+            if not alive:
+                self._set_crash("final probe after the run stopped: %s" % why)
+                return False
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return True
+            time.sleep(min(interval, remaining))
+
+    def _set_crash(self, why):
+        self.crash = {
+            "case": self._last_case_index,
+            "cases_run": self.cases,
+            "reason": why,
+            "when": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "send_len": len(self._last_send) if self._last_send else 0,
+        }
+        self._write_crash_files()
+        return self.crash
 
     def _write_crash_files(self):
         """Land the crash on disk the moment it is detected.
@@ -499,10 +634,84 @@ class CodesysMonitor(BaseMonitor):
         struct = structured_request(self._last_send)
         case = self.crash.get("case")
 
-        cmd = ("python codesysfuzzer/codesys_fuzzer.py %s -r %s --case %s "
-               "--seed %s --surface off"
-               % (self.target or "<target>", self.request_name or "<request>",
-                  case, self.seed))
+        group, service, sent_body = parse_sent_parts(self._last_send)
+        body_hex = sent_body.hex() if sent_body is not None else None
+        plan = None
+        seed_run = None
+        if self.seed_body is not None:
+            try:
+                plan = self.seed_body.plan_for_case(case)
+            except Exception:
+                plan = None
+            # The recorded case is the one whose send was being read when the
+            # death was noticed.  A crash can trail its trigger by a few
+            # requests, so the report also keeps the last few packets that went
+            # out (below).  The corpus/parameters are kept for the optional
+            # whole-prefix replay, not because the last body is useless.
+            # The cap only exists so a pathological corpus (thousands of large
+            # bodies) cannot bloat every report.
+            if case is not None:
+                seeds = self.seed_body.seeds
+                if (len(seeds) <= 512
+                        and sum(len(s.body) for s in seeds) <= (1 << 20)):
+                    seed_run = {
+                        "run_seed": self.seed_body.run_seed,
+                        "mode": self.seed_body.mode,
+                        "mutations_per_seed":
+                            self.seed_body.mutations_per_seed,
+                        "max_body_size": self.seed_body.max_body_size,
+                        "order": self.seed_body.order,
+                        "start": int(self.run_start or 1),
+                        "cases": int(case),
+                        "seeds": [{"group": "0x%04x" % s.group,
+                                   "service": "0x%04x" % s.service,
+                                   "body": s.body.hex()} for s in seeds],
+                    }
+
+        # The candidates: the last few requests that actually went out, oldest
+        # first.  Pure recorded bytes — replay sends these, it does not build
+        # anything.  One MiB is enough for the default ten bodies even when
+        # some of them are multi-KB grow mutations.
+        trail = []
+        trail_bytes = 0
+        for index, raw in self.recent:
+            if raw is None:
+                continue
+            g, s, sent = parse_sent_parts(raw)
+            if g is None or not sent:
+                continue
+            if trail_bytes + len(sent) > (1 << 20):
+                break
+            row = {"case": index, "group": "0x%04x" % g,
+                   "service": "0x%04x" % s, "body_hex": sent.hex(),
+                   # The full frame as it went on the wire, so a later
+                   # --case-report can print the same "Raw bytes" section a
+                   # crash report does.  The framing is per-connection (token,
+                   # session id, block ids), but it is still the exact bytes
+                   # that were sent, which is what a report should show.
+                   "sent_hex": raw.hex()}
+            if self.seed_body is not None:
+                try:
+                    row["seed_plan"] = self.seed_body.plan_for_case(index)
+                except Exception:
+                    row["seed_plan"] = None
+            trail.append(row)
+            trail_bytes += len(raw)
+
+        if plan is not None:
+            # A seed-mode case cannot be reproduced by index alone: the index
+            # maps to a (seed, mutation) pair under a particular corpus.  The
+            # report carries the corpus and the run parameters, so --replay
+            # does not depend on the original corpus still being there.
+            cmd = ("python codesysfuzzer/codesys_fuzzer.py %s --replay %s.json"
+                   % (self.target or "<target>", base))
+            cmd_replay =  ("python codesysfuzzer/codesys_fuzzer.py %s --replay %s.json --replay-case %s"
+                   % (self.target or "<target>", base, int(case)-2))
+        else:
+            cmd = ("python codesysfuzzer/codesys_fuzzer.py %s -r %s --case %s "
+                   "--seed %s --surface off --force-new"
+                   % (self.target or "<target>", self.request_name or "<request>",
+                      case, self.seed))
 
         lines = [
             "CODESYS V3 fuzzer - crash report",
@@ -519,13 +728,42 @@ class CodesysMonitor(BaseMonitor):
             "",
             "Reproduce",
             "-" * 68,
-            "  %s" % cmd,
+            "  %s" % cmd_replay if plan else cmd,
             "",
-            "  The seed is required: the random parts of a request come from the",
-            "  run's seed, so the same case index with a different seed sends",
-            "  different bytes.  --surface off keeps the replay out of the pair",
-            "  file.  Do not use --resume for this: it continues at the next case",
-            "  and skips this one.",
+        ]
+        if seed_run is not None:
+            lines += [
+                "  --replay sends the last body above (the packet that was on the",
+                "  wire when the runtime died).  Detection is after the fact, so",
+                "  the recent-packets list below is the better first stop when",
+                "  this one does not reproduce.",
+                "",
+                "  This report also embeds the corpus and the run parameters.  To",
+                "  re-send the whole segment this run covered:",
+                "    %s --replay-prefix" % cmd,
+                "  (cases %d..%d — a resumed run is its own segment on a fresh"
+                % (int(seed_run.get("start") or 1), case),
+                "  runtime, so the replay starts at the resume point, not at 1).",
+            ]
+        elif plan is not None:
+            lines += [
+                "  Warning: the corpus was too large to embed in this report, so",
+                "  --replay can send only the last body.  If it does not reproduce,",
+                "  re-run the original --from-seeds campaign with the same --seed",
+                "  and corpus.",
+            ]
+        else:
+            lines += [
+                "  The seed is required: the random parts of a request come from",
+                "  the run's seed, so the same case index with a different seed",
+                "  sends different bytes.  --surface off keeps the replay out of",
+                "  the pair file.  --force-new discards this run's resume point:",
+                "  the crashed run left a state file, and the guard against",
+                "  clobbering it would otherwise refuse the command.  Do not use",
+                "  --resume instead: it continues at the next case and skips this",
+                "  one.",
+            ]
+        lines += [
             "",
             "Structured request (group / service / tags)",
             "-" * 68,
@@ -540,6 +778,51 @@ class CodesysMonitor(BaseMonitor):
                 lines.extend(_fmt_nodes(struct["body"], 1))
         else:
             lines.append("  (the sent frame did not parse as a services request)")
+        if plan is not None:
+            lines += [
+                "",
+                "Seed mutation",
+                "-" * 68,
+                "  corpus seed : %s" % plan.get("seed"),
+                "  mode        : %s" % plan.get("mode"),
+                "  stage       : %s" % plan.get("stage"),
+                "  operations  : %s" % json.dumps(plan.get("ops"), sort_keys=True),
+                "",
+                "  The final body and (when it fits) the corpus are stored in the",
+                "  JSON report, so --replay does not need the original corpus",
+                "  directory to still exist.",
+            ]
+        if trail:
+            lines += [
+                "",
+                "Recent packets, oldest first (candidates for the real trigger)",
+                "-" * 68,
+                "  the crash is noticed after the packet that caused it, so the",
+                "  case above is the detection point, not necessarily the trigger",
+                "",
+                "  case   bytes  mutation",
+            ]
+            for row in trail:
+                op = ""
+                p = row.get("seed_plan")
+                if p and p.get("ops"):
+                    op = " ".join("%s %s" % (o.get("kind"), o.get("path"))
+                                  for o in p["ops"])
+                lines.append("  %-5s  %-5d  %s"
+                             % (row["case"], len(row["body_hex"]) // 2, op))
+            lines += [
+                "",
+                "  Send them one at a time, in order, keeping the run's pace:",
+                "    %s --replay-trail" % cmd,
+                "  or isolate a candidate:",
+                "    %s --replay-case <case>" % cmd,
+                "  (--replay-wait N inserts N seconds between packets; that can",
+                "   suppress a timing-sensitive crash, so use it only when finer",
+                "   attribution is worth changing the pacing.)",
+                "",
+                "  Once a case is confirmed, write it up like this report:",
+                "    %s --case-report <case>" % cmd,
+            ]
         lines += [
             "",
             "Raw bytes (block driver + datagram + channel frames + services)",
@@ -562,6 +845,12 @@ class CodesysMonitor(BaseMonitor):
                 "cases_run": self.crash.get("cases_run"),
                 "detector": self.crash.get("reason"),
                 "seed": self.seed,
+                "group": "0x%04x" % group if group is not None else None,
+                "service": "0x%04x" % service if service is not None else None,
+                "body_hex": body_hex,
+                "seed_plan": plan,
+                "seed_run": seed_run,
+                "recent": trail,
                 "database": self.db_path,
                 "reproduce_command": cmd,
                 "sent_bytes": len(self._last_send),
@@ -605,18 +894,16 @@ class CodesysMonitor(BaseMonitor):
                 % (self.crash["case"], self.crash["reason"])).encode()
 
 
-def structured_request(sent):
-    """The sent request as a nested tag tree with values, for a crash report.
+def structured_from_body(group, service, body):
+    """A services body as the nested tag tree a crash report shows.
 
-    ``{"group": int, "service": int, "body": [node, ...]}`` where a node is
-    ``{"id": int, "container": bool, "value": bytes, "children": [...]}``.  This
-    is the "simplified" form: the same bytes as the hexdump, but arranged the way
-    the handler reads them, so a reader can see which tag held the oversized
-    value without decoding LEB128 by hand.
+    Factored out of :func:`structured_request` because the case-report
+    generator has the body (rebuilt from the seed enumeration) but not the
+    original live frame.
     """
-    group, service, body = parse_sent_parts(sent)
-    if group is None:
-        return None
+    if body is None:
+        return {"group": group, "service": service, "parse_error": "no body",
+                "body_hex": ""}
 
     def node(t):
         # wire id: parse_tags masks bit 7, so a container 0x86 arrives as 0x06.
@@ -635,6 +922,21 @@ def structured_request(sent):
         return {"group": group, "service": service, "parse_error": str(e),
                 "body_hex": body.hex()}
     return {"group": group, "service": service, "body": [node(t) for t in tags]}
+
+
+def structured_request(sent):
+    """The sent request as a nested tag tree with values, for a crash report.
+
+    ``{"group": int, "service": int, "body": [node, ...]}`` where a node is
+    ``{"id": int, "container": bool, "value": bytes, "children": [...]}``.  This
+    is the "simplified" form: the same bytes as the hexdump, but arranged the way
+    the handler reads them, so a reader can see which tag held the oversized
+    value without decoding LEB128 by hand.
+    """
+    group, service, body = parse_sent_parts(sent)
+    if group is None:
+        return None
+    return structured_from_body(group, service, body)
 
 
 def _fmt_nodes(nodes, indent=0):

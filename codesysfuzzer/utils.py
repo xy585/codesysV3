@@ -31,9 +31,13 @@ import random
 import struct
 import zlib
 
-from boofuzz import blocks, s_block, s_group, s_initialize, s_random, s_static
+from boofuzz import (
+    Fuzzable, blocks, s_block, s_group, s_initialize, s_random, s_static,
+)
 from boofuzz.blocks import Size
 from boofuzz.primitives.random_data import RandomData
+
+from mutator import mutate_seed, parse_seed
 
 from proto import (
     DATAGRAM_HEADER, DATAGRAM_MAGIC, HDR_PREFIX_WORDS, PKT_INFO, PROTO_TAG,
@@ -224,6 +228,119 @@ def s_lying_leb_size(block_name, name=None):
     """A fuzzable declared length that may disagree with the block it names."""
     blocks.CURRENT.push(LyingLeb128Size(
         name=name, block_name=block_name, request=blocks.CURRENT, length=3))
+
+
+# ============================================================
+# Seed-driven body
+# ============================================================
+#
+# The models in services.py are grammar-driven: each field is a primitive and
+# boofuzz gets one mutation per primitive.  A SeedBody is the data-driven
+# counterpart — one primitive whose mutations are pre-mutated copies of real
+# request bodies.  Because it is the *only* fuzzable primitive under ``body``
+# (and therefore the only one in the whole request), boofuzz's depth-1
+# enumeration is exactly "one mutant per case", and depth 2 immediately runs out
+# of valid combinations (the one primitive cannot be mutated twice).
+
+class SeedBody(Fuzzable):
+    """A body built by mutating captured request bodies.
+
+    ``seeds`` are :class:`corpus.Seed` objects for one (group, service) pair.
+    The default value is the first seed's body; every mutation is derived
+    deterministically from the run seed, the seed's sha1 and the case index.
+
+    ``case_index`` inside :func:`mutator.mutate_seed` is local to the seed.  The
+    order of ``seeds`` and the per-seed budget are fixed for a run, so the local
+    index is recoverable from boofuzz's global mutant index — that is what
+    :meth:`plan_for_case` does for the crash report.
+    """
+
+    def __init__(self, seeds, run_seed, mode="structured",
+                 mutations_per_seed=256, max_body_size=65536,
+                 order="contiguous", name="seed_body"):
+        self.seeds = list(seeds)
+        if not self.seeds:
+            raise ValueError("SeedBody needs at least one seed")
+        if order not in ("contiguous", "round-robin"):
+            raise ValueError("order must be 'contiguous' or 'round-robin' "
+                             "(got %r)" % (order,))
+        if mode not in ("raw", "structured", "hybrid"):
+            raise ValueError("mode must be raw, structured or hybrid "
+                             "(got %r)" % (mode,))
+        self.run_seed = int(run_seed) & 0xFFFFFFFF
+        self.mode = mode
+        self.mutations_per_seed = max(1, int(mutations_per_seed))
+        self.max_body_size = int(max_body_size)
+        self.order = order
+        self._parsed = {}
+        super().__init__(name=name, default_value=self.seeds[0].body,
+                         fuzzable=True)
+
+    # -- planning -------------------------------------------------
+    def _tree(self, seed):
+        if seed.sha1 not in self._parsed:
+            self._parsed[seed.sha1] = parse_seed(seed.body)
+        return self._parsed[seed.sha1]
+
+    def _peer_bodies(self, seed):
+        return [s.body for s in self.seeds if s.sha1 != seed.sha1]
+
+    def _case(self, global_index):
+        """Global 1-based case index -> ``(seed, local_index)``."""
+        index = int(global_index) - 1
+        per_seed = self.mutations_per_seed
+        if self.order == "round-robin":
+            count = len(self.seeds)
+            return self.seeds[index % count], (index // count) + 1
+        return (self.seeds[index // per_seed],
+                (index % per_seed) + 1)
+
+    def _mutate(self, seed, local_index):
+        parsed = None if self.mode == "raw" else self._tree(seed)
+        return mutate_seed(
+            seed, local_index, self.run_seed, mode=self.mode,
+            budget=self.mutations_per_seed, max_body_size=self.max_body_size,
+            parsed=parsed, peer_bodies=self._peer_bodies(seed))
+
+    # -- boofuzz interface ---------------------------------------
+    def mutations(self, default_value):
+        if self.order == "round-robin":
+            groups = ((seed, local)
+                      for local in range(1, self.mutations_per_seed + 1)
+                      for seed in self.seeds)
+        else:
+            groups = ((seed, local)
+                      for seed in self.seeds
+                      for local in range(1, self.mutations_per_seed + 1))
+        for seed, local in groups:
+            body, _plan = self._mutate(seed, local)
+            yield body
+
+    def num_mutations(self, default_value=None):
+        # Overridden deliberately: Fuzzable's default exhausts mutations(),
+        # which for a large corpus means building every mutant just to count it.
+        return len(self.seeds) * self.mutations_per_seed
+
+    def body_for_case(self, global_index):
+        """``(body, plan)`` for a global case index, or ``None``.
+
+        The case index is the same one boofuzz reports and ``--case`` takes.
+        Used by the case-report generator: a crash report names the case that
+        was confirmed by hand, and the body for it may not be in the recent
+        trail (the trigger can be outside those ten).
+        """
+        if global_index is None:
+            return None
+        index = int(global_index)
+        if index < 1 or index > self.num_mutations():
+            return None
+        seed, local = self._case(index)
+        return self._mutate(seed, local)
+
+    def plan_for_case(self, global_index):
+        """The mutation plan the crash report should record, or ``None``."""
+        result = self.body_for_case(global_index)
+        return None if result is None else result[1]
 
 
 def s_tagged(tag_id, block_name, filler=b"\x00", min_length=0, max_length=None,
@@ -532,7 +649,7 @@ OVERSIZE_VALUES = [leb128_pad3(n) for n in
 
 #: re-exported so services.py and the tests share one definition
 __all__ = [
-    "Leb128Size", "LyingLeb128Size", "FrameEncoder", "s_leb_size",
+    "Leb128Size", "LyingLeb128Size", "FrameEncoder", "SeedBody", "s_leb_size",
     "s_lying_leb_size", "s_tagged",
     "s_u32_tag", "s_container", "s_initialize", "s_block", "s_group",
     "s_random", "s_run_random", "RunRandom", "set_run_seed", "run_seed",

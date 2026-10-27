@@ -256,6 +256,148 @@ tag) is what a real service looks like**; `refused` with the group's *own*
 fallback code — which is per group, `770` for most but `24` for `0x12`/`0x13` —
 means "no such service"; and anything else means a handler ran and decided.
 
+### Seed mutation: fuzzing real bodies
+
+The models above are grammar-driven: a request is described field by field and
+boofuzz mutates one primitive per case. `--from-seeds` is the other half of the
+input problem: start from a **real request body** and change its bytes. It is
+not a second fuzzer — the transport, handshake, `FrameEncoder`, monitor, surface
+recorder, run state and crash reports are the same. Only the body source
+changes.
+
+A seed is the services-layer body, not a whole frame. Channel token, block ids
+and session id are live connection state and would be dead by the next run;
+`content_size`, frame lengths and CRC32 are recomputed by the existing skeleton.
+
+**Bootstrap a corpus** — no capture required, because every model's unmutated
+render is a request the runtime is known to accept:
+
+```
+python codesysfuzzer/codesys_fuzzer.py <target> -r trace_configure \
+    --dry-run --send --save-seed seeds/
+```
+
+Other sources:
+
+```
+# bodies the runtime accepted during any run
+python codesysfuzzer/codesys_fuzzer.py <target> -r trace_configure 5000 \
+    --capture-seeds seeds/          # written to seeds/candidates/
+# a pcap/pcapng (TCP block driver or the UDP flash gateway)
+python codesysfuzzer/tools/extract_seeds.py trace2.pcapng -o seeds/
+# hand-written JSON/JSONL, or <group>_<service>_<name>.bin
+```
+
+Run it:
+
+```
+python codesysfuzzer/codesys_fuzzer.py <target> --from-seeds seeds/
+python codesysfuzzer/codesys_fuzzer.py <target> --from-seeds seeds/ --mutate raw
+python codesysfuzzer/codesys_fuzzer.py <target> --from-seeds seeds/ \
+    --group 0x0f --service 0x0002 --cases 5000
+```
+
+Mutation modes:
+
+| mode | unit | stays parseable? |
+|---|---|---|
+| `raw` | bytes: flips, interesting values, ints, delete/insert/duplicate, truncate, extend, splice | no — this is what probes the tag walker |
+| `structured` (default) | tag tree: id, declared length, value | yes, unless the mutation is a deliberate length lie |
+| `hybrid` | both, plus a 1-4 operator havoc stack per case | mixed |
+
+Structured mutation re-encodes with the protocol's own conventions (three-byte
+leaf lengths, two-byte container lengths), so a mutated request still walks the
+same way. One operator deliberately breaks that: a length lie declares more
+bytes than are present, the same class as `trace_configure_liar`.
+
+**Reproducibility.** Every case is a pure function of `(run seed, seed sha1,
+case index)`; the first half of each seed's budget is a systematic byte/tag
+sweep, the rest is seeded havoc. The run state records the corpus digest and
+manifest, and a resume against a changed corpus is refused — index N would name
+a different packet. `--case N --seed S` works exactly as it does for a model.
+
+**Resuming.** A seed-mode state records the corpus path, so one file is enough:
+
+```
+python codesysfuzzer/codesys_fuzzer.py <target> --resume logs/seed_0f_0002.state.json
+```
+
+If the state predates `corpus_path`, pass the same corpus as well
+(`--from-seeds seeds/`). Resume restores the recorded mutation mode,
+mutations-per-seed, `--max-body-size`, seed order and `--cases` end; changing
+any of those without saying so would make case N a different packet. The corpus
+digest is checked first, and `--capture-seeds` writes to `DIR/candidates` which
+is *not* folded into the active corpus — import it explicitly with
+`--from-seeds DIR/candidates` when you want it.
+
+Progress is written back to **the file you resumed from**, not to
+`<log-dir>/<request>.state.json`; otherwise the file you are watching stays
+frozen while a second state file quietly takes the updates. If you want to move
+it, pass `--state <new-file>` deliberately.
+
+A batch (`--from-seeds` over several pairs) stops when the current pair is
+interrupted, crashes, or cannot get a session, and prints the `--resume` command
+for that pair. Re-running the same `--from-seeds` command **auto-resumes each
+pair from its own state file** (restoring that pair's run seed, mode, budget,
+body cap and order); `--force-new` is the way to start them over. Continuing
+after a crash is what leaves a trail of 0-case state files: the runtime is gone,
+so every remaining pair just fails its handshake.
+
+**What `last_case`/`cases_run` mean.** They count *completed* test cases, not
+printed pair headers. The state is written after the first completed case, every
+`--state-every` cases (default 25), and once when the run stops; a pair whose
+file still shows 0 never got a session or never finished a case. `last_case` is
+boofuzz's `total_mutant_index`, and `--resume` starts at `last_case + 1`.
+
+**Crashes.** The crash report carries the mutated `body_hex`, the seed sha1 and
+the mutation plan. Reproduce with:
+
+```
+python codesysfuzzer/codesys_fuzzer.py <target> --replay logs/seed_0f_0002_crash_*.json
+```
+
+`--replay` does **not** resend the captured frame; it rebuilds the request
+around the live session. By default it sends only the recorded last body —
+the packet that was on the wire when the runtime died. Detection is after the
+fact, so the report also keeps the **last ten packets that went out**; when the
+single body does not reproduce, send them one at a time with
+
+```
+python codesysfuzzer/codesys_fuzzer.py <target> --replay logs/seed_*_crash_*.json --replay-trail
+```
+
+which sends them in order at the run's own pace (an added delay changes the
+request timing, and a timing-sensitive crash can stop reproducing) and watches
+the listener after the last one; `--replay-wait N` inserts N seconds between
+packets for finer attribution at that risk, and `--replay-case N` sends one
+case on its own (from the trail, the report's last frame, or the embedded
+corpus). Once a case is confirmed, `--case-report N` writes a
+crash-report-style .txt for it — case, structured tag tree, mutation plan, raw
+services body, and the full sent frame when the report recorded one:
+
+```
+python codesysfuzzer/codesys_fuzzer.py <target> --replay logs/seed_*_crash_*.json --case-report 88
+```
+
+A case outside the recorded trail is rebuilt from the report's embedded corpus
+(so its body and plan are exact); a full wire frame exists only for the cases
+the report actually recorded. A seed-mode report also embeds the corpus and run
+parameters for `--replay-prefix`, which re-runs the recorded segment (resume
+point..crash); that is a fallback, not the default, and it resends only recorded
+fuzz data.
+
+**How the two modes relate.** They share one pipeline but do not share a case
+stream. A seed belongs to one `(group, service)`, so there is nothing to sweep;
+and mixing generated and mutated cases would make a global case index depend on
+a scheduling weight. Combine them at the corpus boundary instead: model bodies
+are seeds, and accepted mutants become candidate seeds for the next run.
+
+**Limits.** Length checks are only as good as the seed: a body captured from a
+different application version may be rejected immediately. Seeds are stored per
+pair and are not rewritten to another handler automatically (the model
+`--group sweep` shape router is the analogue). Nothing is added to the active
+corpus mid-run; `--capture-seeds` writes candidates so numbering stays stable.
+
 ### Request models
 
 `trace_configure` reproduces the captured `TRACE_CFG_TEMPLATE`
@@ -332,12 +474,16 @@ with `db_filename`.
 
 ## Verified
 
-* `test_framing.py` — 58 offline assertions, including that the unmutated
+* `test_framing.py` — 67 offline assertions, including that the unmutated
   `trace_configure` body is byte-identical to `TRACE_CFG_TEMPLATE`, that the
   whole rendered TCP frame equals what `CodesysTcpClient` builds, that
   fragmentation matches `send_blk` frame-for-frame (per-frame datagram and
   block-driver headers included), that rendering is deterministic, and that
   every model builds and has mutations.
+* `test_seed.py` — 66 offline assertions for seed mode: corpus dedupe and
+  ordering, candidates excluded from the active digest, strict tag parse /
+  re-encode round-trip, deterministic mutations, `SeedBody` case→mutation
+  mapping, multi-frame body reassembly, and the crash report's replay fields.
 * Live, against Control Win V3 3.5.18.20: `--dry-run --send` for both
   `trace_list` and `trace_configure` is **accepted by the runtime** — the latter
   creates a trace and returns a handle, so the modelled packet is one the real

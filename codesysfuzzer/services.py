@@ -37,7 +37,7 @@ frames as it takes, which is the ceiling the UDP PoC could not get past.
 
 import struct
 
-from boofuzz import s_group, s_static
+from boofuzz import blocks, s_group, s_static
 
 from proto import tag
 from utils import (
@@ -612,6 +612,35 @@ def build_request(name, state, group=None, service=None, raw_body=False,
         builder = body_from_tags(seed_tags)
 
     return request_skeleton(name, state, group, service, builder)
+
+
+def build_seed_request(name, state, group, service_id, seed_body):
+    """A request whose body is one :class:`utils.SeedBody` primitive.
+
+    ``group``/``service_id`` are ints: a seed belongs to exactly one pair and
+    routing it elsewhere is a different campaign (the existing ``--group``
+    sweep on a model).  Everything above and below the body is the ordinary
+    skeleton, so ``content_size`` and the frame sequence are still computed from
+    whatever the mutator produced.
+    """
+    def body_fn():
+        blocks.CURRENT.push(seed_body)
+
+    return request_skeleton(name, state, group, service_id, body_fn)
+
+
+def build_static_request(name, state, group, service_id, body):
+    """A request with an exact body, for ``--replay``.
+
+    A static body is not fuzzable: replay sends one known packet, not a case
+    enumeration.  It still goes through the skeleton, so the session id is
+    injected and the framing/CRC are rebuilt for the live connection instead of
+    reusing the dead one from the crash report.
+    """
+    def body_fn():
+        s_static(body, name="replay_body")
+
+    return request_skeleton(name, state, group, service_id, body_fn)
 
 
 def request_names():

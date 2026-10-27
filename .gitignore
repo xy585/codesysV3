@@ -7,3 +7,6 @@
 references/
 logs/
 pcapng/
+logs-seed/
+seeds/
+tmp-ida/
